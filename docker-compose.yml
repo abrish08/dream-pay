@@ -1,0 +1,160 @@
+# The SAME image, three ways:
+#
+#   Monolith:       docker compose --profile mono up --build
+#                   all modules in one process, in-memory bus, one database.
+#
+#   Microservices:  docker compose --profile micro up --build
+#                   every module is its own service with its OWN database;
+#                   modules talk only through NATS; "edge" routes HTTP by path.
+#
+# Either way, call http://localhost:8080. Dev-only secrets below; in
+# production load them from a secret manager.
+
+# Every service: the PUBLIC key to verify access tokens locally.
+x-common: &common
+  AUTH_PUBLIC_KEYS: oT1PA8eS/We0c2DbqJwA5ByeLAX/HQ9PEWXgLF/zqLw=
+  DATA_ENCRYPTION_KEY: a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=
+  WEBHOOK_ALLOW_INSECURE: "true"
+  PUBLIC_BASE_URL: http://localhost:8080
+
+# Only the auth service: the PRIVATE signing key, the API key pepper and the
+# first admin account. Never give these to other services.
+x-auth-secrets: &auth-secrets
+  AUTH_SIGNING_KEY: /9VGdLTrbK5xeuOwrEUuvY+epWSJyw6V0wGwGsEg060=
+  API_KEY_PEPPER: pepper-dev-0123456789abcdef0123456789abcdef
+  BOOTSTRAP_ADMIN_EMAIL: admin@paygate.local
+  BOOTSTRAP_ADMIN_PASSWORD: change-me-admin-password
+
+x-service: &service
+  build: .
+  restart: unless-stopped
+  profiles: [micro]
+  depends_on:
+    postgres: { condition: service_healthy }
+    nats: { condition: service_started }
+
+x-micro-env: &micro-env
+  <<: *common
+  BUS: nats
+  NATS_URL: nats://nats:4222
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: gateway
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deployments/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 30
+
+  # ---------------- monolith ----------------
+  paygate:
+    build: .
+    restart: unless-stopped
+    profiles: [mono]
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["8080:8080"]
+    environment:
+      <<: [*common, *auth-secrets]
+      MODULES: all
+      BUS: memory
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gateway?sslmode=disable
+
+  # ---------------- microservices: one per module ----------------
+  nats:
+    image: nats:2.10-alpine
+    profiles: [micro]
+    command: ["-js", "-sd", "/data"]
+    ports: ["4222:4222"]
+
+  merchant:
+    <<: *service
+    environment:
+      <<: *micro-env
+      MODULES: merchant
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_merchant?sslmode=disable
+
+  auth:
+    <<: *service
+    environment:
+      <<: [*micro-env, *auth-secrets]
+      MODULES: auth
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_auth?sslmode=disable
+
+  provider:
+    <<: *service
+    environment:
+      <<: *micro-env
+      MODULES: provider
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_provider?sslmode=disable
+
+  payment:
+    <<: *service
+    deploy: { replicas: 2 } # replicas share the load through NATS queue groups
+    environment:
+      <<: *micro-env
+      MODULES: payment
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_payment?sslmode=disable
+
+  refund:
+    <<: *service
+    environment:
+      <<: *micro-env
+      MODULES: refund
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_refund?sslmode=disable
+
+  ledger:
+    <<: *service
+    environment:
+      <<: *micro-env
+      MODULES: ledger
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_ledger?sslmode=disable
+
+  webhook:
+    <<: *service
+    environment:
+      <<: *micro-env
+      MODULES: webhook
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_webhook?sslmode=disable
+
+  reconciliation:
+    <<: *service
+    environment:
+      <<: *micro-env
+      MODULES: reconciliation
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_reconciliation?sslmode=disable
+
+  edge:
+    build: .
+    profiles: [micro]
+    entrypoint: ["/edge"]
+    ports: ["8080:8080"]
+    environment:
+      EDGE_ADDR: ":8080"
+      ROUTES: >-
+        /auth=http://auth:8080,
+        /.well-known=http://auth:8080,
+        /v1/api-keys=http://auth:8080,
+        /v1/team=http://auth:8080,
+        /admin/users=http://auth:8080,
+        /admin/merchants=http://merchant:8080,
+        /admin/merchants/*/api-keys=http://auth:8080,
+        /providers=http://provider:8080,
+        /v1/payments=http://payment:8080,
+        /v1/refunds=http://refund:8080,
+        /v1/balance=http://ledger:8080,
+        /admin/ledger=http://ledger:8080,
+        /v1/webhook-endpoints=http://webhook:8080,
+        /v1/webhook-deliveries=http://webhook:8080,
+        /admin/reconciliation=http://reconciliation:8080
+
+volumes:
+  pgdata:
