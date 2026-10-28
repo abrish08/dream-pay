@@ -91,9 +91,42 @@ func (h *HTTP) mockComplete(w http.ResponseWriter, r *http.Request) {
 	_ = page.Execute(w, map[string]any{"TxRef": t.TxRef, "Done": true, "Status": t.Status})
 }
 
+// RegisterPublic: GET /v1/payment-methods?currency=ETB, what a merchant can
+// offer right now (API keys see their own environment).
+func (h *HTTP) RegisterPublic(r chi.Router) {
+	r.Get("/payment-methods", func(w http.ResponseWriter, r *http.Request) {
+		p := httpx.Principal(r)
+		env := p.Environment
+		if env == "" {
+			env = r.URL.Query().Get("environment")
+		}
+		if env == "" {
+			env = "live"
+		}
+		ms, err := h.svc.ListMethods(r.Context(), providers.ListMethods{Environment: env, Currency: r.URL.Query().Get("currency")})
+		if err != nil {
+			httpx.WriteError(w, r, h.log, err)
+			return
+		}
+		for i := range ms {
+			ms[i].Providers = nil // routing is internal
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"data": ms})
+	})
+}
+
+// RegisterAdmin: GET /admin/providers, adapters, routing and health.
+func (h *HTTP) RegisterAdmin(r chi.Router) {
+	r.With(httpx.Require(providers.PermRead, h.log)).Get("/providers", func(w http.ResponseWriter, r *http.Request) {
+		live, _ := h.svc.ListMethods(r.Context(), providers.ListMethods{Environment: "live", Currency: "ETB"})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"providers": h.svc.Health(), "live_routes_etb": live})
+	})
+}
+
 // RegisterBus answers the provider module's requests on the central bus.
 func RegisterBus(b bus.Bus, svc *service.Service) {
 	bus.Handle(b, svc.InitiateCheckout)
+	bus.Handle(b, svc.ListMethods)
 	bus.Handle(b, svc.Refund)
 	bus.Handle(b, func(ctx context.Context, q providers.VerifyTransaction) (providers.Transaction, error) {
 		return svc.VerifyTransaction(ctx, q.Provider, q.TxRef)

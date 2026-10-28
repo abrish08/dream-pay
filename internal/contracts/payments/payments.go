@@ -33,7 +33,8 @@ type Payment struct {
 	RefundedAmount int64             `json:"refunded_amount"`
 	Currency       string            `json:"currency"`
 	Status         string            `json:"status"`
-	Provider       string            `json:"provider"`
+	PaymentMethod  string            `json:"payment_method,omitempty"`
+	Provider       string            `json:"provider,omitempty"`
 	ProviderRef    string            `json:"provider_ref,omitempty"`
 	Reference      string            `json:"reference"`
 	Description    string            `json:"description,omitempty"`

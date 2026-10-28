@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"paygate/internal/contracts/payments"
+	"paygate/internal/contracts/payouts"
 	"paygate/internal/contracts/refunds"
 	"paygate/internal/platform/apperror"
 	"paygate/internal/platform/secrets"
@@ -21,6 +22,8 @@ var PublicEventTypes = map[string]string{
 	payments.TopicPaymentExpired:   "payment.expired",
 	refunds.TopicRefundSucceeded:   "refund.succeeded",
 	refunds.TopicRefundFailed:      "refund.failed",
+	payouts.TopicPayoutPaid:        "payout.paid",
+	payouts.TopicPayoutFailed:      "payout.failed",
 }
 
 const MaxAttempts = 8

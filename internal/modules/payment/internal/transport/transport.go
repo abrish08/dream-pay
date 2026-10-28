@@ -31,6 +31,7 @@ func (h *HTTP) create(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Amount      int64             `json:"amount"`
 		Currency    string            `json:"currency"`
+		Method      string            `json:"payment_method"`
 		Provider    string            `json:"provider"`
 		Reference   string            `json:"reference"`
 		Description string            `json:"description"`
@@ -49,7 +50,7 @@ func (h *HTTP) create(w http.ResponseWriter, r *http.Request) {
 	p := httpx.Principal(r)
 	pay, created, err := h.svc.Create(r.Context(), service.CreateInput{
 		MerchantID: p.MerchantID, Environment: p.Environment, IdempotencyKey: r.Header.Get("Idempotency-Key"),
-		Amount: body.Amount, Currency: body.Currency, Provider: body.Provider, Reference: body.Reference,
+		Amount: body.Amount, Currency: body.Currency, Method: body.Method, Provider: body.Provider, Reference: body.Reference,
 		Description: body.Description, Metadata: body.Metadata,
 		CustomerEmail: body.Customer.Email, CustomerName: body.Customer.Name, ReturnURL: body.ReturnURL,
 		ExpiresInMin: body.ExpiresInMinutes,

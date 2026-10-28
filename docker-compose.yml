@@ -7,23 +7,24 @@
 #                   every module is its own service with its OWN database;
 #                   modules talk only through NATS; "edge" routes HTTP by path.
 #
-# Either way, call http://localhost:8080. Dev-only secrets below; in
+# Either way, call http://localhost:8080. Secrets come from .env (create it
+# with ./scripts/run.sh env); compose refuses to start if one is missing. In
 # production load them from a secret manager.
 
 # Every service: the PUBLIC key to verify access tokens locally.
 x-common: &common
-  AUTH_PUBLIC_KEYS: oT1PA8eS/We0c2DbqJwA5ByeLAX/HQ9PEWXgLF/zqLw=
-  DATA_ENCRYPTION_KEY: a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=
+  AUTH_PUBLIC_KEYS: ${AUTH_PUBLIC_KEYS:?create .env with ./scripts/run.sh env}
+  DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?create .env with ./scripts/run.sh env}
   WEBHOOK_ALLOW_INSECURE: "true"
   PUBLIC_BASE_URL: http://localhost:8080
 
 # Only the auth service: the PRIVATE signing key, the API key pepper and the
 # first admin account. Never give these to other services.
 x-auth-secrets: &auth-secrets
-  AUTH_SIGNING_KEY: /9VGdLTrbK5xeuOwrEUuvY+epWSJyw6V0wGwGsEg060=
-  API_KEY_PEPPER: pepper-dev-0123456789abcdef0123456789abcdef
-  BOOTSTRAP_ADMIN_EMAIL: admin@paygate.local
-  BOOTSTRAP_ADMIN_PASSWORD: change-me-admin-password
+  AUTH_SIGNING_KEY: ${AUTH_SIGNING_KEY:?create .env with ./scripts/run.sh env}
+  API_KEY_PEPPER: ${API_KEY_PEPPER:?create .env with ./scripts/run.sh env}
+  BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?create .env with ./scripts/run.sh env}
+  BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?create .env with ./scripts/run.sh env}
 
 x-service: &service
   build: .
@@ -132,6 +133,13 @@ services:
       MODULES: reconciliation
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_reconciliation?sslmode=disable
 
+  payout:
+    <<: *service
+    environment:
+      <<: *micro-env
+      MODULES: payout
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_payout?sslmode=disable
+
   edge:
     build: .
     profiles: [micro]
@@ -144,11 +152,26 @@ services:
         /.well-known=http://auth:8080,
         /v1/api-keys=http://auth:8080,
         /v1/team=http://auth:8080,
+        /v1/roles=http://auth:8080,
+        /v1/permissions=http://auth:8080,
+        /v1/audit-log=http://auth:8080,
         /admin/users=http://auth:8080,
+        /admin/roles=http://auth:8080,
+        /admin/permissions=http://auth:8080,
+        /admin/audit-log=http://auth:8080,
+        /openapi.yaml=http://auth:8080,
+        /docs=http://auth:8080,
+        /swagger=http://auth:8080,
+        /v1/merchant=http://merchant:8080,
+        /v1/payouts=http://payout:8080,
+        /admin/payouts=http://payout:8080,
         /admin/merchants=http://merchant:8080,
         /admin/merchants/*/api-keys=http://auth:8080,
         /providers=http://provider:8080,
         /v1/payments=http://payment:8080,
+        /pay=http://payment:8080,
+        /v1/payment-methods=http://provider:8080,
+        /admin/providers=http://provider:8080,
         /v1/refunds=http://refund:8080,
         /v1/balance=http://ledger:8080,
         /admin/ledger=http://ledger:8080,

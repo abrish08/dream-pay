@@ -36,6 +36,7 @@ func TestValidation(t *testing.T) {
 		"zero amount":  {Amount: 0, Currency: "ETB", Provider: "mock", Reference: "x"},
 		"bad currency": {Amount: 1, Currency: "EUR", Provider: "mock", Reference: "x"},
 		"no reference": {Amount: 1, Currency: "ETB", Provider: "mock"},
+		"bad method":   {Amount: 1, Currency: "ETB", Method: "bitcoin", Reference: "x"},
 		"bad email":    {Amount: 1, Currency: "ETB", Provider: "mock", Reference: "x", CustomerEmail: "nope"},
 		"ttl too long": {Amount: 1, Currency: "ETB", Provider: "mock", Reference: "x", TTL: 48 * time.Hour},
 		"bad url":      {Amount: 1, Currency: "ETB", Provider: "mock", Reference: "x", ReturnURL: "javascript:x"},
@@ -58,7 +59,7 @@ func TestStateMachine(t *testing.T) {
 	if err := p.TransitionTo(Succeeded, now); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("pending -> succeeded must be rejected, got %v", err)
 	}
-	if err := p.StartProcessing("ref", "url", now); err != nil {
+	if err := p.StartProcessing("mock", "ref", "url", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.TransitionTo(Succeeded, now); err != nil {
@@ -75,7 +76,7 @@ func TestStateMachine(t *testing.T) {
 func TestRefunds(t *testing.T) {
 	now := time.Now()
 	p := newPayment(t)
-	_ = p.StartProcessing("ref", "url", now)
+	_ = p.StartProcessing("mock", "ref", "url", now)
 	_ = p.TransitionTo(Succeeded, now)
 
 	if err := p.ApplyRefund(50_000, now); err != nil || p.Status != PartiallyRefunded {
@@ -95,7 +96,7 @@ func TestExpiry(t *testing.T) {
 	if !p.ExpiresAt.Equal(p.CreatedAt.Add(30 * time.Minute)) {
 		t.Fatal("expires_at not set from TTL")
 	}
-	_ = p.StartProcessing("ref", "url", now)
+	_ = p.StartProcessing("mock", "ref", "url", now)
 	if err := p.Expire(now); err != nil || p.Status != Expired || p.Captured() {
 		t.Fatalf("expire: %v %s", err, p.Status)
 	}

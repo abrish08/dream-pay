@@ -95,6 +95,34 @@ func (s *Service) CreateEndpoint(ctx context.Context, merchantID, rawURL string,
 		Warning: "Store this signing secret now. It will not be shown again."}, nil
 }
 
+// RotateSecret replaces an endpoint's signing secret. The new secret is
+// shown once; deliveries sent from now on are signed with it.
+func (s *Service) RotateSecret(ctx context.Context, merchantID, id string) (CreatedEndpoint, error) {
+	tok, err := secrets.RandomToken(24)
+	if err != nil {
+		return CreatedEndpoint{}, err
+	}
+	secret := "whsec_" + tok
+	enc, err := s.box.Encrypt(secret)
+	if err != nil {
+		return CreatedEndpoint{}, err
+	}
+	if err := s.store.SetEndpointSecret(s.db.WithContext(ctx), merchantID, id, enc); err != nil {
+		return CreatedEndpoint{}, err
+	}
+	e, err := s.store.GetEndpoint(s.db.WithContext(ctx), id)
+	if err != nil {
+		return CreatedEndpoint{}, err
+	}
+	return CreatedEndpoint{EndpointView: endpointView(e), Secret: secret,
+		Warning: "Store this signing secret now. It will not be shown again."}, nil
+}
+
+// RetryDelivery sends a failed (or still pending) delivery again right away.
+func (s *Service) RetryDelivery(ctx context.Context, merchantID, id string) error {
+	return s.store.RetryDelivery(s.db.WithContext(ctx), merchantID, id, s.now())
+}
+
 func (s *Service) ListEndpoints(ctx context.Context, merchantID string) ([]EndpointView, error) {
 	es, err := s.store.ListEndpoints(s.db.WithContext(ctx), merchantID, false)
 	if err != nil {

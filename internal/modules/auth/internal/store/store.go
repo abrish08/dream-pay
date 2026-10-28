@@ -17,7 +17,8 @@ var (
 	ErrKeyNotFound     = apperror.NotFound("api_key_not_found", "API key not found")
 	ErrUserNotFound    = apperror.NotFound("user_not_found", "user not found")
 	ErrSessionNotFound = apperror.Unauthorized("invalid_refresh_token", "refresh token is invalid or expired")
-	ErrEmailTaken      = apperror.Conflict("email_taken", "a user with this email already exists")
+	ErrEmailTaken      = apperror.Conflict("email_taken",
+		"an account with this email already exists: sign in (password, Google or Apple) or use \"Forgot password\"")
 )
 
 type Store struct{ db *gorm.DB }
@@ -50,13 +51,18 @@ func deref(s *string) string {
 // ---- users ----
 
 func toUserRec(u *domain.User) userRec {
-	return userRec{u.ID, u.Email, u.Name, u.PasswordHash, nilIfEmpty(u.MerchantID), u.Role, u.Status, u.FailedLogins,
-		u.LockedUntil, u.LastLoginAt, nilIfEmpty(u.CreatedBy), u.CreatedAt, u.UpdatedAt}
+	return userRec{ID: u.ID, Email: u.Email, Name: u.Name, PasswordHash: u.PasswordHash, MerchantID: nilIfEmpty(u.MerchantID),
+		Role: u.Role, Status: u.Status, FailedLogins: u.FailedLogins, LockedUntil: u.LockedUntil, LastLoginAt: u.LastLoginAt,
+		EmailVerifiedAt: u.EmailVerifiedAt, Phone: u.Phone, PhoneVerifiedAt: u.PhoneVerifiedAt, TOTPSecret: u.TOTPSecret,
+		TOTPEnabledAt: u.TOTPEnabledAt, TOTPLastStep: u.TOTPLastStep,
+		CreatedBy: nilIfEmpty(u.CreatedBy), CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt}
 }
 
 func (r userRec) domain() *domain.User {
 	return &domain.User{ID: r.ID, Email: r.Email, Name: r.Name, PasswordHash: r.PasswordHash, MerchantID: deref(r.MerchantID),
 		Role: r.Role, Status: r.Status, FailedLogins: r.FailedLogins, LockedUntil: r.LockedUntil, LastLoginAt: r.LastLoginAt,
+		EmailVerifiedAt: r.EmailVerifiedAt, Phone: r.Phone, PhoneVerifiedAt: r.PhoneVerifiedAt, TOTPSecret: r.TOTPSecret,
+		TOTPEnabledAt: r.TOTPEnabledAt, TOTPLastStep: r.TOTPLastStep,
 		CreatedBy: deref(r.CreatedBy), CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
 }
 
@@ -88,6 +94,12 @@ func (s *Store) findUser(ctx context.Context, lock bool, where string, args ...a
 		return nil, err
 	}
 	return rec.domain(), nil
+}
+
+func (s *Store) EmailTaken(ctx context.Context, email string) (bool, error) {
+	var n int64
+	err := s.q(ctx).Model(&userRec{}).Where("email = ?", email).Count(&n).Error
+	return n > 0, err
 }
 
 // UserByEmail locks the row (login updates failed-attempt counters).
@@ -270,3 +282,184 @@ func (s *Store) UpsertMerchant(ctx context.Context, id, status string, updatedAt
 
 // DB exposes the handle for events.HandleOnce.
 func (s *Store) DB() *gorm.DB { return s.db }
+
+// ---- external identities (Google / Apple) ----
+
+// UserByIdentity returns the user linked to a provider account, or nil.
+func (s *Store) UserByIdentity(ctx context.Context, provider, subject string) (*domain.User, error) {
+	var rec identityRec
+	err := s.q(ctx).Where("provider = ? AND subject = ?", provider, subject).Take(&rec).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.UserByID(ctx, rec.UserID, false)
+}
+
+func (s *Store) LinkIdentity(ctx context.Context, provider, subject, userID, email string, now time.Time) error {
+	return s.q(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&identityRec{ID: uuid.NewString(),
+		Provider: provider, Subject: subject, UserID: userID, Email: email, CreatedAt: now}).Error
+}
+
+// ---- password resets ----
+
+var ErrResetInvalid = apperror.Invalid("invalid_reset_token", "this reset link is invalid or has expired; request a new one")
+
+func (s *Store) CreateReset(ctx context.Context, userID, tokenHash, ip string, expires, now time.Time) error {
+	return s.q(ctx).Create(&passwordResetRec{ID: uuid.NewString(), UserID: userID, TokenHash: tokenHash,
+		ExpiresAt: expires, RequestIP: ip, CreatedAt: now}).Error
+}
+
+func (s *Store) CountResetsSince(ctx context.Context, userID string, since time.Time) (int64, error) {
+	var n int64
+	err := s.q(ctx).Model(&passwordResetRec{}).Where("user_id = ? AND created_at > ?", userID, since).Count(&n).Error
+	return n, err
+}
+
+// UseReset locks an unused, unexpired token and returns its user id.
+func (s *Store) UseReset(ctx context.Context, tokenHash string, now time.Time) (string, error) {
+	var rec passwordResetRec
+	err := s.q(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("token_hash = ? AND used_at IS NULL AND expires_at > ?", tokenHash, now).Take(&rec).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", ErrResetInvalid
+	}
+	if err != nil {
+		return "", err
+	}
+	return rec.UserID, nil
+}
+
+// CloseResets marks every open reset token of the user as used.
+func (s *Store) CloseResets(ctx context.Context, userID string, now time.Time) error {
+	return s.q(ctx).Model(&passwordResetRec{}).Where("user_id = ? AND used_at IS NULL", userID).
+		Update("used_at", now).Error
+}
+
+// ---- verification codes ----
+
+type Code struct {
+	ID, UserID, Channel, Destination, CodeHash string
+	Attempts                                   int
+	ExpiresAt, CreatedAt                       time.Time
+}
+
+// NewCode replaces any open code of the user: only the newest code works.
+func (s *Store) NewCode(ctx context.Context, c Code) error {
+	if err := s.q(ctx).Model(&verificationCodeRec{}).Where("user_id = ? AND used_at IS NULL", c.UserID).
+		Update("used_at", c.CreatedAt).Error; err != nil {
+		return err
+	}
+	return s.q(ctx).Create(&verificationCodeRec{ID: uuid.NewString(), UserID: c.UserID, Channel: c.Channel,
+		Destination: c.Destination, CodeHash: c.CodeHash, ExpiresAt: c.ExpiresAt, CreatedAt: c.CreatedAt}).Error
+}
+
+// CodeStats: when the last code was sent and how many in the window.
+func (s *Store) CodeStats(ctx context.Context, userID string, since time.Time) (last time.Time, n int64, err error) {
+	var row struct {
+		Last *time.Time
+		N    int64
+	}
+	err = s.q(ctx).Model(&verificationCodeRec{}).Select("MAX(created_at) AS last, COUNT(*) AS n").
+		Where("user_id = ? AND created_at > ?", userID, since).Scan(&row).Error
+	if row.Last != nil {
+		last = *row.Last
+	}
+	return last, row.N, err
+}
+
+// OpenCode locks the user's current code (unused, unexpired), or nil.
+func (s *Store) OpenCode(ctx context.Context, userID string, now time.Time) (*Code, error) {
+	var r verificationCodeRec
+	err := s.q(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ? AND used_at IS NULL AND expires_at > ?", userID, now).Order("created_at DESC").Take(&r).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &Code{ID: r.ID, UserID: r.UserID, Channel: r.Channel, Destination: r.Destination, CodeHash: r.CodeHash,
+		Attempts: r.Attempts, ExpiresAt: r.ExpiresAt, CreatedAt: r.CreatedAt}, nil
+}
+
+// CodeAttempt records a wrong try; the code dies after max attempts.
+func (s *Store) CodeAttempt(ctx context.Context, id string, attempts, max int, now time.Time) error {
+	upd := map[string]any{"attempts": attempts}
+	if attempts >= max {
+		upd["used_at"] = now
+	}
+	return s.q(ctx).Model(&verificationCodeRec{}).Where("id = ?", id).Updates(upd).Error
+}
+
+func (s *Store) UseCode(ctx context.Context, id string, now time.Time) error {
+	return s.q(ctx).Model(&verificationCodeRec{}).Where("id = ?", id).Update("used_at", now).Error
+}
+
+// ---- MFA login challenges ----
+
+type Challenge struct {
+	ID, UserID string
+	Attempts   int
+}
+
+func (s *Store) CreateChallenge(ctx context.Context, userID, tokenHash string, expires, now time.Time) error {
+	return s.q(ctx).Create(&mfaChallengeRec{ID: uuid.NewString(), UserID: userID, TokenHash: tokenHash,
+		ExpiresAt: expires, CreatedAt: now}).Error
+}
+
+func (s *Store) OpenChallenge(ctx context.Context, tokenHash string, now time.Time) (*Challenge, error) {
+	var r mfaChallengeRec
+	err := s.q(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("token_hash = ? AND used_at IS NULL AND expires_at > ?", tokenHash, now).Take(&r).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &Challenge{ID: r.ID, UserID: r.UserID, Attempts: r.Attempts}, nil
+}
+
+func (s *Store) ChallengeAttempt(ctx context.Context, id string, attempts, max int, now time.Time) error {
+	upd := map[string]any{"attempts": attempts}
+	if attempts >= max {
+		upd["used_at"] = now
+	}
+	return s.q(ctx).Model(&mfaChallengeRec{}).Where("id = ?", id).Updates(upd).Error
+}
+
+func (s *Store) UseChallenge(ctx context.Context, id string, now time.Time) error {
+	return s.q(ctx).Model(&mfaChallengeRec{}).Where("id = ?", id).Update("used_at", now).Error
+}
+
+// ---- recovery codes ----
+
+func (s *Store) ReplaceRecoveryCodes(ctx context.Context, userID string, hashes []string, now time.Time) error {
+	if err := s.q(ctx).Where("user_id = ?", userID).Delete(&recoveryCodeRec{}).Error; err != nil {
+		return err
+	}
+	if len(hashes) == 0 {
+		return nil
+	}
+	recs := make([]recoveryCodeRec, len(hashes))
+	for i, h := range hashes {
+		recs[i] = recoveryCodeRec{ID: uuid.NewString(), UserID: userID, CodeHash: h, CreatedAt: now}
+	}
+	return s.q(ctx).Create(&recs).Error
+}
+
+// UseRecoveryCode spends a matching unused code; false if none matches.
+func (s *Store) UseRecoveryCode(ctx context.Context, userID, hash string, now time.Time) (bool, error) {
+	res := s.q(ctx).Model(&recoveryCodeRec{}).Where("user_id = ? AND code_hash = ? AND used_at IS NULL", userID, hash).
+		Update("used_at", now)
+	return res.RowsAffected > 0, res.Error
+}
+
+func (s *Store) RecoveryCodesLeft(ctx context.Context, userID string) (int64, error) {
+	var n int64
+	err := s.q(ctx).Model(&recoveryCodeRec{}).Where("user_id = ? AND used_at IS NULL", userID).Count(&n).Error
+	return n, err
+}

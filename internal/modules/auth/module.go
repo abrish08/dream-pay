@@ -6,6 +6,7 @@ package auth
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -15,7 +16,10 @@ import (
 	"paygate/internal/modules/auth/internal/transport"
 	"paygate/internal/platform/authn"
 	"paygate/internal/platform/bus"
+	"paygate/internal/platform/mail"
 	"paygate/internal/platform/module"
+	"paygate/internal/platform/secrets"
+	"paygate/internal/platform/sms"
 )
 
 const Name = "auth"
@@ -34,6 +38,14 @@ type Deps struct {
 
 	BootstrapEmail    string
 	BootstrapPassword string
+	BootstrapName     string
+
+	Identity     map[string]*authn.OIDC // Google / Apple sign-in (only the configured ones)
+	Box          *secrets.Box           // encrypts authenticator secrets (DATA_ENCRYPTION_KEY)
+	SMS          sms.Sender             // verification codes by SMS (send.et); nil = email only
+	Mailer       mail.Sender
+	DashboardURL string
+	ResetTTL     time.Duration
 }
 
 type Module struct {
@@ -54,6 +66,8 @@ func New(d Deps) *Module {
 		Pepper:            domain.Pepper{Version: d.PepperVersion, Secret: d.Pepper},
 		BootstrapEmail:    d.BootstrapEmail,
 		BootstrapPassword: d.BootstrapPassword,
+		BootstrapName:     d.BootstrapName,
+		Identity:          d.Identity, Box: d.Box, SMS: d.SMS, Mailer: d.Mailer, DashboardURL: d.DashboardURL, ResetTTL: d.ResetTTL,
 	}
 	if len(d.PreviousPepper) > 0 {
 		cfg.PreviousPepper = &domain.Pepper{Version: d.PepperVersion - 1, Secret: d.PreviousPepper}

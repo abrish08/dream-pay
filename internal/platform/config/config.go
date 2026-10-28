@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"paygate/internal/platform/authn"
+	"paygate/internal/platform/mail"
+	"paygate/internal/platform/sms"
 )
 
 type Config struct {
@@ -43,13 +45,12 @@ type Config struct {
 	APIKeyPepperPrevious   string // set only while rotating the pepper
 	BootstrapAdminEmail    string // first super_admin, created once
 	BootstrapAdminPassword string
+	BootstrapAdminName     string
 
 	EncryptionKey         []byte
 	PublicBaseURL         string
 	AllowInsecureWebhooks bool
 	AllowMockInLive       bool
-
-	Chapa ChapaConfig
 
 	// Rate limits (per process). 0 disables.
 	RateLimitRPS     float64 // per API key / user on /v1 and /admin
@@ -59,13 +60,33 @@ type Config struct {
 	CORSOrigins      []string
 
 	// Payments without a final answer from the provider expire after this.
-	PaymentTTL time.Duration
-}
+	// Sign in with Google / Apple: the client ids of YOUR apps (web client id,
+	// iOS bundle id, Android client id, Apple services id). Empty = disabled.
+	GoogleClientIDs []string
+	AppleClientIDs  []string
+	GoogleJWKSURL   string // override for tests; default Google's public keys
+	AppleJWKSURL    string
 
-type ChapaConfig struct {
-	BaseURL       string
-	SecretKey     string
-	WebhookSecret string
+	// Email (password reset, notices). Without SMTP_HOST emails are only
+	// logged (development).
+	SMTPHost, SMTPPort, SMTPUsername, SMTPPassword, MailFrom string
+	DashboardURL                                             string        // where reset links point (your dashboard)
+	PasswordResetTTL                                         time.Duration // default 30m
+	Mailer                                                   mail.Sender   // set directly by tests / embedders; overrides SMTP
+
+	// SMS through send.et (verification codes by SMS). Empty key = disabled.
+	SendEtAPIKey, SendEtSender, SendEtBaseURL string
+	SMS                                       sms.Sender // set directly by tests; overrides send.et
+
+	// HSTS: tell browsers to use HTTPS only (enable when served over HTTPS).
+	HSTS bool
+
+	// ProviderRoutes: payment method -> providers in order of preference,
+	// from PROVIDER_ROUTES="telebirr=telebirr;card=ethswitch,bank_x".
+	ProviderRoutes map[string][]string
+
+	PaymentTTL         time.Duration
+	PaymentExpiryEvery time.Duration // how often overdue payments are checked (default 15s)
 }
 
 func Load() (Config, error) {
@@ -82,14 +103,10 @@ func Load() (Config, error) {
 		AuthKeyCacheTTL:        30 * time.Second,
 		BootstrapAdminEmail:    os.Getenv("BOOTSTRAP_ADMIN_EMAIL"),
 		BootstrapAdminPassword: os.Getenv("BOOTSTRAP_ADMIN_PASSWORD"),
+		BootstrapAdminName:     env("BOOTSTRAP_ADMIN_NAME", "Administrator"),
 		PublicBaseURL:          strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
 		AllowInsecureWebhooks:  envBool("WEBHOOK_ALLOW_INSECURE", false),
 		AllowMockInLive:        envBool("ALLOW_MOCK_PROVIDER_IN_LIVE", false),
-		Chapa: ChapaConfig{
-			BaseURL:       env("CHAPA_BASE_URL", "https://api.chapa.co"),
-			SecretKey:     os.Getenv("CHAPA_SECRET_KEY"),
-			WebhookSecret: os.Getenv("CHAPA_WEBHOOK_SECRET"),
-		},
 	}
 
 	if mods := strings.TrimSpace(env("MODULES", "all")); mods != "all" {
@@ -130,6 +147,39 @@ func Load() (Config, error) {
 			c.CORSOrigins = append(c.CORSOrigins, o)
 		}
 	}
+	c.GoogleClientIDs = list(os.Getenv("GOOGLE_CLIENT_IDS"))
+	c.AppleClientIDs = list(os.Getenv("APPLE_CLIENT_IDS"))
+	c.GoogleJWKSURL, c.AppleJWKSURL = os.Getenv("GOOGLE_JWKS_URL"), os.Getenv("APPLE_JWKS_URL")
+	c.SMTPHost, c.SMTPPort = os.Getenv("SMTP_HOST"), env("SMTP_PORT", "587")
+	c.SMTPUsername, c.SMTPPassword = os.Getenv("SMTP_USERNAME"), os.Getenv("SMTP_PASSWORD")
+	c.MailFrom = env("MAIL_FROM", "paygate <no-reply@example.com>")
+	c.DashboardURL = env("DASHBOARD_URL", c.PublicBaseURL)
+	c.PasswordResetTTL = 30 * time.Minute
+	if v := os.Getenv("PASSWORD_RESET_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 5*time.Minute || d > 24*time.Hour {
+			return c, fmt.Errorf("PASSWORD_RESET_TTL must be between 5m and 24h")
+		}
+		c.PasswordResetTTL = d
+	}
+	c.SendEtAPIKey, c.SendEtSender = os.Getenv("SENDET_API_KEY"), env("SENDET_SENDER", "Paygate")
+	c.SendEtBaseURL = env("SENDET_BASE_URL", "https://api.send.et/v1")
+	c.HSTS = envBool("HSTS", false)
+	c.ProviderRoutes = map[string][]string{}
+	for _, part := range strings.Split(os.Getenv("PROVIDER_ROUTES"), ";") {
+		if part = strings.TrimSpace(part); part == "" {
+			continue
+		}
+		method, list, ok := strings.Cut(part, "=")
+		if !ok || strings.TrimSpace(method) == "" {
+			return c, fmt.Errorf("PROVIDER_ROUTES: %q must look like method=provider1,provider2", part)
+		}
+		for _, p := range strings.Split(list, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				c.ProviderRoutes[strings.TrimSpace(method)] = append(c.ProviderRoutes[strings.TrimSpace(method)], p)
+			}
+		}
+	}
 	c.PaymentTTL = 30 * time.Minute
 	if v := os.Getenv("PAYMENT_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -137,6 +187,15 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("PAYMENT_TTL must be a duration between 1m and 168h")
 		}
 		c.PaymentTTL = d
+	}
+
+	c.PaymentExpiryEvery = 15 * time.Second
+	if v := os.Getenv("PAYMENT_EXPIRY_CHECK_EVERY"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 100*time.Millisecond {
+			return c, fmt.Errorf("PAYMENT_EXPIRY_CHECK_EVERY must be a duration of at least 100ms")
+		}
+		c.PaymentExpiryEvery = d
 	}
 
 	if k := os.Getenv("DATA_ENCRYPTION_KEY"); k != "" {
@@ -169,12 +228,15 @@ func (c Config) Validate(known []string) error {
 		if (c.BootstrapAdminEmail == "") != (c.BootstrapAdminPassword == "") {
 			return fmt.Errorf("set both BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD, or neither")
 		}
+		if c.BootstrapAdminPassword == "CHANGE_ME" || c.BootstrapAdminEmail == "admin@example.com" {
+			return fmt.Errorf("BOOTSTRAP_ADMIN_EMAIL / BOOTSTRAP_ADMIN_PASSWORD still have the example values; set your own in .env")
+		}
 	}
 	if len(c.AuthPublicKeys) == 0 && len(c.AuthSigningKey) == 0 {
 		return fmt.Errorf("AUTH_PUBLIC_KEYS is required: every service verifies access tokens with the auth service's public key")
 	}
-	if c.ModuleEnabled("webhook") && len(c.EncryptionKey) != 32 {
-		return fmt.Errorf("DATA_ENCRYPTION_KEY is required by the webhook module")
+	if (c.ModuleEnabled("webhook") || c.ModuleEnabled("auth")) && len(c.EncryptionKey) != 32 {
+		return fmt.Errorf("DATA_ENCRYPTION_KEY is required by the webhook and auth modules")
 	}
 	if !c.AllEnabled(known) && c.Bus != "nats" {
 		return fmt.Errorf("MODULES runs only part of the system here: set BUS=nats so modules in other processes can be reached")
@@ -262,4 +324,14 @@ func envFloat(key string, def float64) float64 {
 		return v
 	}
 	return def
+}
+
+func list(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }

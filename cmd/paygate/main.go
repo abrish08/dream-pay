@@ -34,6 +34,13 @@ func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Development convenience: load .env from this folder or a parent.
+	// Real environment variables always win over the file.
+	if path, err := config.LoadDotEnv(); err != nil {
+		return fmt.Errorf("reading .env: %w", err)
+	} else if path != "" {
+		log.Info("settings loaded from file", "file", path)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err

@@ -27,11 +27,26 @@ func NewHTTP(svc *service.Service, jwks *authn.Verifier, log *slog.Logger) *HTTP
 
 // RegisterOpen: no credentials needed.
 //
+//	POST /auth/signup           {business_name, name, email, password, phone?, website?, verification_channel?}
+//	                            -> pending merchant + owner; a 6-digit code is sent (no token yet)
+//	POST /auth/verify           {email, code}      -> account verified, logged in
+//	POST /auth/verify/resend    {email, channel?}  -> always 202
+//	POST /auth/login/mfa        {mfa_token, code}  -> second step when an authenticator is on
+//	POST /auth/oauth/{google|apple} {id_token, nonce?, business_name?} -> sign in / link / sign up
+//	POST /auth/password/forgot  {email}            -> always 202 (emails a reset link if the account exists)
+//	POST /auth/password/reset   {token, new_password}
 //	POST /auth/login            {email, password}  -> access + refresh token
 //	POST /auth/refresh          {refresh_token}    -> new pair (old refresh token stops working)
 //	POST /auth/logout           {refresh_token}
 //	GET  /.well-known/jwks.json  public keys to verify access tokens
 func (h *HTTP) RegisterOpen(r chi.Router) {
+	r.Post("/auth/signup", h.signup)
+	r.Post("/auth/verify", h.verify)
+	r.Post("/auth/verify/resend", h.resendCode)
+	r.Post("/auth/login/mfa", h.loginMFA)
+	r.Post("/auth/oauth/{provider}", h.external)
+	r.Post("/auth/password/forgot", h.forgot)
+	r.Post("/auth/password/reset", h.reset)
 	r.Post("/auth/login", h.login)
 	r.Post("/auth/refresh", h.refresh)
 	r.Post("/auth/logout", h.logout)
@@ -44,7 +59,14 @@ func (h *HTTP) RegisterOpen(r chi.Router) {
 // RegisterAuthenticated: any valid credentials.
 func (h *HTTP) RegisterAuthenticated(r chi.Router) {
 	r.Get("/auth/me", h.me)
-	r.With(httpx.RequireUser(h.log)).Post("/auth/password", h.changePassword)
+	r.Group(func(r chi.Router) {
+		r.Use(httpx.RequireUser(h.log))
+		r.Post("/auth/password", h.changePassword) // needs an authenticator code
+		r.Get("/auth/mfa", h.mfaStatus)
+		r.Post("/auth/mfa/totp/setup", h.totpSetup)
+		r.Post("/auth/mfa/totp/confirm", h.totpConfirm)
+		r.Post("/auth/mfa/totp/disable", h.totpDisable)
+	})
 }
 
 // RegisterPublic: /v1, merchant callers. Keys, team members and roles can
@@ -148,6 +170,124 @@ func (h *HTTP) login(w http.ResponseWriter, r *http.Request) {
 	h.respond(w, r, http.StatusOK, t, err)
 }
 
+func (h *HTTP) verify(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Email string `json:"email"`
+		Code  string `json:"code"`
+	}
+	if !h.decode(w, r, &body) {
+		return
+	}
+	t, err := h.svc.VerifyAccount(r.Context(), body.Email, body.Code)
+	h.respond(w, r, http.StatusOK, t, err)
+}
+
+func (h *HTTP) resendCode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Email   string `json:"email"`
+		Channel string `json:"channel"`
+	}
+	if !h.decode(w, r, &body) {
+		return
+	}
+	if err := h.svc.ResendVerification(r.Context(), body.Email, body.Channel); err != nil {
+		h.log.Error("resend verification", "err", err)
+	}
+	httpx.WriteJSON(w, http.StatusAccepted, map[string]string{
+		"message": "If this account is waiting for verification, a new code is on its way."})
+}
+
+func (h *HTTP) loginMFA(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		MFAToken string `json:"mfa_token"`
+		Code     string `json:"code"`
+	}
+	if !h.decode(w, r, &body) {
+		return
+	}
+	t, err := h.svc.LoginMFA(r.Context(), body.MFAToken, body.Code)
+	h.respond(w, r, http.StatusOK, t, err)
+}
+
+func (h *HTTP) mfaStatus(w http.ResponseWriter, r *http.Request) {
+	v, err := h.svc.MFAStatus(r.Context(), httpx.Principal(r))
+	h.respond(w, r, http.StatusOK, v, err)
+}
+
+func (h *HTTP) totpSetup(w http.ResponseWriter, r *http.Request) {
+	v, err := h.svc.SetupTOTP(r.Context(), httpx.Principal(r))
+	h.respond(w, r, http.StatusOK, v, err)
+}
+
+func (h *HTTP) totpConfirm(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if !h.decode(w, r, &body) {
+		return
+	}
+	v, err := h.svc.ConfirmTOTP(r.Context(), httpx.Principal(r), body.Code)
+	h.respond(w, r, http.StatusOK, v, err)
+}
+
+func (h *HTTP) totpDisable(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Password string `json:"password"`
+		Code     string `json:"code"`
+	}
+	if !h.decode(w, r, &body) {
+		return
+	}
+	h.noContent(w, r, h.svc.DisableTOTP(r.Context(), httpx.Principal(r), body.Password, body.Code))
+}
+
+func (h *HTTP) signup(w http.ResponseWriter, r *http.Request) {
+	var body service.SignupInput
+	if !h.decode(w, r, &body) {
+		return
+	}
+	t, err := h.svc.Signup(r.Context(), body)
+	h.respond(w, r, http.StatusCreated, t, err)
+}
+
+func (h *HTTP) external(w http.ResponseWriter, r *http.Request) {
+	var body service.ExternalInput
+	if !h.decode(w, r, &body) {
+		return
+	}
+	t, created, err := h.svc.ExternalSignIn(r.Context(), chi.URLParam(r, "provider"), body)
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	h.respond(w, r, status, t, err)
+}
+
+func (h *HTTP) forgot(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Email string `json:"email"`
+	}
+	if !h.decode(w, r, &body) {
+		return
+	}
+	if err := h.svc.ForgotPassword(r.Context(), body.Email, httpx.ClientIP(r, false)); err != nil {
+		h.log.Error("forgot password", "err", err) // never tell the client: the answer is always the same
+	}
+	httpx.WriteJSON(w, http.StatusAccepted, map[string]string{
+		"message": "If an account uses this email, a reset link is on its way. It expires soon and works once."})
+}
+
+func (h *HTTP) reset(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token       string `json:"token"`
+		NewPassword string `json:"new_password"`
+	}
+	if !h.decode(w, r, &body) {
+		return
+	}
+	h.noContent(w, r, h.svc.ResetPassword(r.Context(), body.Token, body.NewPassword))
+}
+
 func (h *HTTP) refresh(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		RefreshToken string `json:"refresh_token"`
@@ -178,11 +318,12 @@ func (h *HTTP) changePassword(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
+		TOTPCode        string `json:"totp_code"` // from Microsoft Authenticator (or any TOTP app)
 	}
 	if !h.decode(w, r, &body) {
 		return
 	}
-	h.noContent(w, r, h.svc.ChangePassword(r.Context(), httpx.Principal(r), body.CurrentPassword, body.NewPassword))
+	h.noContent(w, r, h.svc.ChangePassword(r.Context(), httpx.Principal(r), body.CurrentPassword, body.NewPassword, body.TOTPCode))
 }
 
 func (h *HTTP) createUser(w http.ResponseWriter, r *http.Request) {

@@ -10,6 +10,7 @@ import (
 
 	"paygate/internal/contracts/refunds"
 	"paygate/internal/modules/refund/internal/domain"
+	"paygate/internal/platform/apperror"
 )
 
 const table = "refunds"
@@ -71,6 +72,33 @@ func (s *Store) StalePending(q *gorm.DB, cutoff time.Time, limit int) ([]domain.
 	err := q.Table(table).Where("status = ? AND updated_at < ?", refunds.StatusPending, cutoff).
 		Order("updated_at").Limit(limit).Find(&out).Error
 	return out, err
+}
+
+// ListForMerchant: newest first, cursor (created_at, id), optional payment filter.
+func (s *Store) ListForMerchant(q *gorm.DB, merchantID, environment, paymentID, startingAfter string, limit int) ([]domain.Refund, bool, error) {
+	q = q.Table(table).Where("merchant_id = ?", merchantID)
+	if environment != "" {
+		q = q.Where("environment = ?", environment)
+	}
+	if paymentID != "" {
+		q = q.Where("payment_id = ?", paymentID)
+	}
+	if startingAfter != "" {
+		if _, err := uuid.Parse(startingAfter); err != nil {
+			return nil, false, apperror.Invalid("invalid_cursor", "starting_after must be a refund id from a previous page")
+		}
+		q = q.Where("(created_at, id) < (SELECT created_at, id FROM refunds WHERE id = ? AND merchant_id = ?)",
+			startingAfter, merchantID)
+	}
+	var out []domain.Refund
+	if err := q.Order("created_at DESC, id DESC").Limit(limit + 1).Find(&out).Error; err != nil {
+		return nil, false, err
+	}
+	more := len(out) > limit
+	if more {
+		out = out[:limit]
+	}
+	return out, more, nil
 }
 
 // LockPayment serialises refund creation per payment (transaction-scoped).

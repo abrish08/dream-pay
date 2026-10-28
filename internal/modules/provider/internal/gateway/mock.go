@@ -28,6 +28,10 @@ func NewMock(state MockState, publicBaseURL string) *Mock {
 
 func (m *Mock) Name() string { return "mock" }
 
+// The sandbox simulates every method, so test mode works for all of them.
+func (m *Mock) Methods() []string    { return providers.Methods }
+func (m *Mock) Currencies() []string { return []string{"ETB", "USD"} }
+
 func (m *Mock) Initiate(ctx context.Context, req providers.InitiateCheckout, _ string) (providers.CheckoutResult, error) {
 	if err := m.state.SaveMock(ctx, req.TxRef, req.Amount, req.Currency, providers.StatusPending); err != nil {
 		return providers.CheckoutResult{}, err

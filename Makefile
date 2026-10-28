@@ -8,7 +8,7 @@ build:
 ENV_FILE ?= .env
 
 env:
-	@test -f .env && echo ".env already exists" || (cp .env.example .env && echo "created .env from .env.example: set DATABASE_URL")
+	./scripts/run.sh env
 
 run:
 	@test -f $(ENV_FILE) || (echo "missing $(ENV_FILE): run 'make env' first" && exit 1)
@@ -46,7 +46,7 @@ down:
 	docker compose --profile mono --profile micro down -v
 
 demo:
-	ADMIN_EMAIL=admin@paygate.local ADMIN_PASSWORD=change-me-admin-password ./scripts/demo.sh
+	./scripts/run.sh demo
 
 keygen:
 	go run ./cmd/paygate keygen

@@ -24,7 +24,9 @@ func (h *HTTP) RegisterPublic(r chi.Router) {
 		r.Post("/webhook-endpoints", h.create)
 		r.Get("/webhook-endpoints", h.list)
 		r.Delete("/webhook-endpoints/{id}", h.delete)
+		r.Post("/webhook-endpoints/{id}/rotate-secret", h.rotate)
 		r.Get("/webhook-deliveries", h.deliveries)
+		r.Post("/webhook-deliveries/{id}/retry", h.retry)
 	})
 }
 
@@ -43,6 +45,23 @@ func (h *HTTP) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, ep)
+}
+
+func (h *HTTP) rotate(w http.ResponseWriter, r *http.Request) {
+	ep, err := h.svc.RotateSecret(r.Context(), httpx.Principal(r).MerchantID, chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.WriteError(w, r, h.log, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, ep)
+}
+
+func (h *HTTP) retry(w http.ResponseWriter, r *http.Request) {
+	if err := h.svc.RetryDelivery(r.Context(), httpx.Principal(r).MerchantID, chi.URLParam(r, "id")); err != nil {
+		httpx.WriteError(w, r, h.log, err)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func (h *HTTP) list(w http.ResponseWriter, r *http.Request) {

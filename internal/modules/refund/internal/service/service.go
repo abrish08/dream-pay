@@ -192,6 +192,27 @@ func (s *Service) Get(ctx context.Context, merchantID, id string) (View, error) 
 	return view(r), nil
 }
 
+type Page struct {
+	Data       []View `json:"data"`
+	HasMore    bool   `json:"has_more"`
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+func (s *Service) List(ctx context.Context, merchantID, environment, paymentID, startingAfter string, limit int) (Page, error) {
+	rs, more, err := s.store.ListForMerchant(s.db.WithContext(ctx), merchantID, environment, paymentID, startingAfter, limit)
+	if err != nil {
+		return Page{}, err
+	}
+	page := Page{Data: make([]View, len(rs)), HasMore: more}
+	for i := range rs {
+		page.Data[i] = view(&rs[i])
+	}
+	if more {
+		page.NextCursor = rs[len(rs)-1].ID
+	}
+	return page, nil
+}
+
 func (s *Service) replay(q *gorm.DB, in CreateInput, hash string) (*domain.Refund, error) {
 	prev, err := s.store.FindByIdempotencyKey(q, in.MerchantID, in.IdempotencyKey)
 	if err != nil || prev == nil {

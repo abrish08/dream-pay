@@ -15,6 +15,7 @@ import (
 type Transaction struct {
 	TxRef       string `gorm:"primaryKey"`
 	Provider    string
+	Method      string
 	ProviderRef string
 	Amount      int64
 	Currency    string

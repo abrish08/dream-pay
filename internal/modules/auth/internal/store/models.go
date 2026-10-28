@@ -26,7 +26,8 @@ import (
 // Models lists every table of the auth service.
 func Models() []any {
 	return []any{&userRec{}, &sessionRec{}, &keyRec{}, &merchantRec{},
-		&permissionRec{}, &roleRec{}, &rolePermissionRec{}, &userRoleRec{}, &auditRec{}}
+		&permissionRec{}, &roleRec{}, &rolePermissionRec{}, &userRoleRec{}, &auditRec{},
+		&identityRec{}, &passwordResetRec{}, &verificationCodeRec{}, &mfaChallengeRec{}, &recoveryCodeRec{}}
 }
 
 // users: people who log in, platform staff (merchant_id NULL) and merchant teams.
@@ -41,9 +42,19 @@ type userRec struct {
 	FailedLogins int        `gorm:"type:integer;not null;default:0"`
 	LockedUntil  *time.Time `gorm:"type:timestamptz"`
 	LastLoginAt  *time.Time `gorm:"type:timestamptz"`
-	CreatedBy    *string    `gorm:"type:uuid"`
-	CreatedAt    time.Time  `gorm:"type:timestamptz;not null"`
-	UpdatedAt    time.Time  `gorm:"type:timestamptz;not null"`
+	// EmailVerifiedAt: set when ownership of the email is proven (Google /
+	// Apple verified email, or a completed password reset).
+	EmailVerifiedAt *time.Time `gorm:"type:timestamptz"`
+	Phone           string     `gorm:"type:text;not null;default:''"` // E.164, e.g. +251911000000
+	PhoneVerifiedAt *time.Time `gorm:"type:timestamptz"`
+	// Authenticator app (TOTP): the secret is encrypted (AES-256-GCM); a
+	// secret without TOTPEnabledAt is a setup not confirmed yet.
+	TOTPSecret    string     `gorm:"column:totp_secret;type:text;not null;default:''"`
+	TOTPEnabledAt *time.Time `gorm:"column:totp_enabled_at;type:timestamptz"`
+	TOTPLastStep  int64      `gorm:"column:totp_last_step;not null;default:0"` // a code is accepted once
+	CreatedBy     *string    `gorm:"type:uuid"`
+	CreatedAt     time.Time  `gorm:"type:timestamptz;not null"`
+	UpdatedAt     time.Time  `gorm:"type:timestamptz;not null"`
 }
 
 func (userRec) TableName() string { return "users" }
@@ -155,3 +166,72 @@ type auditRec struct {
 }
 
 func (auditRec) TableName() string { return "audit_log" }
+
+// user_identities: Google / Apple accounts linked to a user. Subject is the
+// provider's stable user id (emails can change; the subject never does).
+type identityRec struct {
+	ID        string    `gorm:"type:uuid;primaryKey"`
+	Provider  string    `gorm:"type:text;not null;uniqueIndex:user_identities_provider_subject_key,priority:1"`
+	Subject   string    `gorm:"type:text;not null;uniqueIndex:user_identities_provider_subject_key,priority:2"`
+	UserID    string    `gorm:"type:uuid;not null;index:user_identities_user_idx"`
+	Email     string    `gorm:"type:text;not null;default:''"`
+	CreatedAt time.Time `gorm:"type:timestamptz;not null"`
+}
+
+func (identityRec) TableName() string { return "user_identities" }
+
+// password_resets: one row per reset email. Only a SHA-256 of the token is
+// stored; tokens are single-use and expire quickly.
+type passwordResetRec struct {
+	ID        string     `gorm:"type:uuid;primaryKey"`
+	UserID    string     `gorm:"type:uuid;not null;index:password_resets_user_idx"`
+	TokenHash string     `gorm:"type:text;not null;unique"`
+	ExpiresAt time.Time  `gorm:"type:timestamptz;not null"`
+	UsedAt    *time.Time `gorm:"type:timestamptz"`
+	RequestIP string     `gorm:"type:text;not null;default:''"`
+	CreatedAt time.Time  `gorm:"type:timestamptz;not null"`
+}
+
+func (passwordResetRec) TableName() string { return "password_resets" }
+
+// verification_codes: 6-digit codes that prove the user owns the email
+// (channel "email") or the phone (channel "sms"). Stored as HMAC(pepper);
+// 5 attempts, short expiry, single use.
+type verificationCodeRec struct {
+	ID          string     `gorm:"type:uuid;primaryKey"`
+	UserID      string     `gorm:"type:uuid;not null;index:verification_codes_user_idx"`
+	Channel     string     `gorm:"type:text;not null"`
+	Destination string     `gorm:"type:text;not null"`
+	CodeHash    string     `gorm:"type:text;not null"`
+	Attempts    int        `gorm:"type:integer;not null;default:0"`
+	ExpiresAt   time.Time  `gorm:"type:timestamptz;not null"`
+	UsedAt      *time.Time `gorm:"type:timestamptz"`
+	CreatedAt   time.Time  `gorm:"type:timestamptz;not null"`
+}
+
+func (verificationCodeRec) TableName() string { return "verification_codes" }
+
+// mfa_challenges: a correct password with an authenticator enabled gives a
+// short-lived challenge token instead of tokens; the code completes it.
+type mfaChallengeRec struct {
+	ID        string     `gorm:"type:uuid;primaryKey"`
+	UserID    string     `gorm:"type:uuid;not null"`
+	TokenHash string     `gorm:"type:text;not null;unique"`
+	Attempts  int        `gorm:"type:integer;not null;default:0"`
+	ExpiresAt time.Time  `gorm:"type:timestamptz;not null"`
+	UsedAt    *time.Time `gorm:"type:timestamptz"`
+	CreatedAt time.Time  `gorm:"type:timestamptz;not null"`
+}
+
+func (mfaChallengeRec) TableName() string { return "mfa_challenges" }
+
+// recovery_codes: one-time codes for when the phone with the authenticator is lost.
+type recoveryCodeRec struct {
+	ID        string     `gorm:"type:uuid;primaryKey"`
+	UserID    string     `gorm:"type:uuid;not null;index:recovery_codes_user_idx"`
+	CodeHash  string     `gorm:"type:text;not null"`
+	UsedAt    *time.Time `gorm:"type:timestamptz"`
+	CreatedAt time.Time  `gorm:"type:timestamptz;not null"`
+}
+
+func (recoveryCodeRec) TableName() string { return "recovery_codes" }

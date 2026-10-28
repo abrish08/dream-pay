@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"paygate/internal/contracts/payments"
+	"paygate/internal/contracts/payouts"
 	"paygate/internal/contracts/refunds"
 	"paygate/internal/platform/apperror"
 )
@@ -51,6 +52,39 @@ func ProviderClearing(provider, env string) string {
 	return "provider:" + provider + ":clearing:" + env
 }
 func PlatformFees(env string) string { return "platform:fees:" + env }
+
+// MerchantPayoutsPending: money still owed to the merchant but held for a payout.
+func MerchantPayoutsPending(merchantID, env string) string {
+	return "merchant:" + merchantID + ":payouts_pending:" + env
+}
+
+// SettlementBank: the platform's bank account that payouts are sent from.
+func SettlementBank(env string) string { return "platform:settlement_bank:" + env }
+
+func PayoutReserved(payoutID, merchantID, env, currency string, amount int64) Posting {
+	return Posting{Reference: "payout:" + payoutID + ":reserved", Currency: currency, Description: "payout hold",
+		Lines: []Line{
+			{Account: MerchantAvailable(merchantID, env), Debit: amount},
+			{Account: MerchantPayoutsPending(merchantID, env), Credit: amount},
+		}}
+}
+
+func PayoutPaid(e payouts.PayoutPaid) Posting {
+	return Posting{Reference: "payout:" + e.PayoutID + ":paid", Currency: e.Currency,
+		Description: "payout sent, bank ref " + e.BankReference, Lines: []Line{
+			{Account: MerchantPayoutsPending(e.MerchantID, e.Environment), Debit: e.Amount},
+			{Account: SettlementBank(e.Environment), Credit: e.Amount},
+		}}
+}
+
+// PayoutReleased: a failed payout's hold goes back to the available balance.
+func PayoutReleased(e payouts.PayoutFailed) Posting {
+	return Posting{Reference: "payout:" + e.PayoutID + ":released", Currency: e.Currency,
+		Description: "payout failed: " + e.Reason, Lines: []Line{
+			{Account: MerchantPayoutsPending(e.MerchantID, e.Environment), Debit: e.Amount},
+			{Account: MerchantAvailable(e.MerchantID, e.Environment), Credit: e.Amount},
+		}}
+}
 
 // PaymentCaptured: the provider owes us the gross amount; we owe the merchant
 // the net amount; the platform earns the fee.
