@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -23,31 +24,36 @@ import (
 )
 
 type Service struct {
-	db        *gorm.DB
-	store     *store.Store
-	events    events.Publisher
-	bus       bus.Bus // the only way to reach other modules
-	allowMock bool
-	ttl       time.Duration // default time a customer has to pay
-	log       *slog.Logger
-	now       func() time.Time
+	db         *gorm.DB
+	store      *store.Store
+	events     events.Publisher
+	bus        bus.Bus // the only way to reach other modules
+	allowMock  bool
+	publicBase string        // for hosted checkout URLs
+	ttl        time.Duration // default time a customer has to pay
+	// ExpiryEvery: how often the expiry worker runs (default 15s).
+	ExpiryEvery time.Duration
+	log         *slog.Logger
+	now         func() time.Time
 }
 
-func New(db *gorm.DB, pub events.Publisher, b bus.Bus, allowMockInLive bool, ttl time.Duration, log *slog.Logger) *Service {
+func New(db *gorm.DB, pub events.Publisher, b bus.Bus, allowMockInLive bool, ttl time.Duration, publicBase string, log *slog.Logger) *Service {
 	if ttl == 0 {
 		ttl = 30 * time.Minute
 	}
 	return &Service{db: db, store: store.New(db), events: pub, bus: b, allowMock: allowMockInLive, ttl: ttl,
-		log: log, now: func() time.Time { return time.Now().UTC() }}
+		publicBase: strings.TrimRight(publicBase, "/"),
+		log:        log, now: func() time.Time { return time.Now().UTC() }}
 }
 
 type CreateInput struct {
-	MerchantID     string `json:"-"`
-	Environment    string `json:"-"`
-	IdempotencyKey string `json:"-"`
-	Amount         int64  `json:"amount"`
-	Currency       string `json:"currency"`
-	Provider       string `json:"provider"`
+	MerchantID     string            `json:"-"`
+	Environment    string            `json:"-"`
+	IdempotencyKey string            `json:"-"`
+	Amount         int64             `json:"amount"`
+	Currency       string            `json:"currency"`
+	Method         string            `json:"payment_method"`
+	Provider       string            `json:"provider"`
 	Reference      string            `json:"reference"`
 	Description    string            `json:"description"`
 	Metadata       map[string]string `json:"metadata"`
@@ -93,12 +99,17 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (payments.Payment,
 
 	p, err := domain.NewPayment(domain.NewPaymentInput{
 		MerchantID: in.MerchantID, Environment: in.Environment, IdempotencyKey: in.IdempotencyKey,
-		RequestHash: hash, Amount: in.Amount, Currency: in.Currency, Provider: in.Provider,
+		RequestHash: hash, Amount: in.Amount, Currency: in.Currency, Method: in.Method, Provider: in.Provider,
 		Reference: in.Reference, Description: in.Description, Metadata: in.Metadata,
 		CustomerEmail: in.CustomerEmail, CustomerName: in.CustomerName, ReturnURL: in.ReturnURL, TTL: ttl,
 	}, m.FeeBPS, s.now())
 	if err != nil {
 		return payments.Payment{}, false, err
+	}
+	hosted := p.PaymentMethod == "" && p.Provider == ""
+	if hosted {
+		// No method chosen: the customer picks one on our hosted page.
+		p.CheckoutURL = s.publicBase + "/pay/" + p.ID
 	}
 	if err := s.store.Insert(s.db.WithContext(ctx), p); errors.Is(err, store.ErrDuplicate) {
 		// A concurrent request with the same key won the race.
@@ -107,27 +118,35 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (payments.Payment,
 	} else if err != nil {
 		return payments.Payment{}, false, err
 	}
+	if hosted {
+		return toAPI(p), true, nil
+	}
+	p, err = s.start(ctx, p)
+	return toAPI(p), true, err
+}
 
-	// External call happens outside any DB transaction.
+// start routes the payment's method to a provider and opens the checkout
+// there. The external call happens outside any DB transaction.
+func (s *Service) start(ctx context.Context, p *domain.Payment) (*domain.Payment, error) {
 	res, err := bus.Ask(ctx, s.bus, providers.InitiateCheckout{
-		Provider: p.Provider, TxRef: p.ID, Amount: p.Amount, Currency: p.Currency,
-		CustomerEmail: p.CustomerEmail, CustomerName: p.CustomerName, ReturnURL: p.ReturnURL,
+		Method: p.PaymentMethod, Provider: p.Provider, Environment: p.Environment, TxRef: p.ID,
+		Amount: p.Amount, Currency: p.Currency, CustomerEmail: p.CustomerEmail, CustomerName: p.CustomerName,
+		ReturnURL: p.ReturnURL,
 	})
 	if err != nil {
 		reason := "provider_initiation_failed: " + apperror.From(err).Message
 		if ferr := s.fail(ctx, p.ID, reason); ferr != nil {
 			s.log.Error("mark payment failed", "payment_id", p.ID, "err", ferr)
 		}
-		return payments.Payment{}, false, err
+		return nil, err
 	}
-
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		cur, err := s.store.Get(tx, p.ID, true)
 		if err != nil {
 			return err
 		}
 		if cur.Status == domain.Pending {
-			if err := cur.StartProcessing(res.ProviderRef, res.CheckoutURL, s.now()); err != nil {
+			if err := cur.StartProcessing(res.Provider, res.ProviderRef, res.CheckoutURL, s.now()); err != nil {
 				return err
 			}
 			if err := s.store.Save(tx, cur); err != nil {
@@ -137,7 +156,77 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (payments.Payment,
 		p = cur
 		return nil
 	})
-	return toAPI(p), true, err
+	return p, err
+}
+
+// ChooseMethod: the customer picked a method on the hosted page. Returns the
+// provider's checkout URL to redirect to. A second submit (double click,
+// another tab) gets the same checkout instead of a second charge.
+func (s *Service) ChooseMethod(ctx context.Context, id, method string) (string, error) {
+	var p *domain.Payment
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		if p, err = s.store.Get(tx, id, true); err != nil {
+			return err
+		}
+		if p.Status == domain.Processing && p.CheckoutURL != "" && p.Provider != "" {
+			return nil // already started
+		}
+		if err := p.ChooseMethod(method, s.now()); err != nil {
+			return err
+		}
+		return s.store.Save(tx, p)
+	})
+	if err != nil {
+		return "", err
+	}
+	if p.Status == domain.Processing {
+		return p.CheckoutURL, nil
+	}
+	if p, err = s.start(ctx, p); err != nil {
+		return "", err
+	}
+	return p.CheckoutURL, nil
+}
+
+// CheckoutView is what the hosted page shows.
+type CheckoutView struct {
+	ID          string
+	Merchant    string
+	Amount      int64
+	Currency    string
+	Description string
+	Reference   string
+	Status      string
+	Open        bool
+	ExpiresAt   time.Time
+	ReturnURL   string
+	Methods     []providers.MethodInfo
+}
+
+func (s *Service) Checkout(ctx context.Context, id string) (CheckoutView, error) {
+	p, err := s.store.Get(s.db.WithContext(ctx), id, false)
+	if err != nil {
+		return CheckoutView{}, err
+	}
+	v := CheckoutView{ID: p.ID, Amount: p.Amount, Currency: p.Currency, Description: p.Description,
+		Reference: p.Reference, Status: string(p.Status), ExpiresAt: p.ExpiresAt, ReturnURL: p.ReturnURL,
+		Open: p.Status == domain.Pending && s.now().Before(p.ExpiresAt)}
+	if m, err := bus.Ask(ctx, s.bus, merchants.GetMerchant{ID: p.MerchantID}); err == nil {
+		v.Merchant = m.Name
+	}
+	if v.Open {
+		ms, err := bus.Ask(ctx, s.bus, providers.ListMethods{Environment: p.Environment, Currency: p.Currency})
+		if err != nil {
+			return CheckoutView{}, err
+		}
+		for _, m := range ms {
+			if m.Available {
+				v.Methods = append(v.Methods, m)
+			}
+		}
+	}
+	return v, nil
 }
 
 func (s *Service) replay(ctx context.Context, merchantID, key, hash string) (*domain.Payment, error) {
@@ -157,7 +246,7 @@ func (s *Service) checkEnvironment(in CreateInput) error {
 		// Dashboard users have no environment; payments come from merchant servers.
 		return apperror.Forbidden("api_key_required", "create payments with a live or test API key")
 	}
-	if in.Environment == "test" && in.Provider != "mock" {
+	if in.Environment == "test" && in.Provider != "" && in.Provider != "mock" {
 		return apperror.Invalid("provider_not_allowed", "test API keys can only use the mock provider")
 	}
 	if in.Environment == "live" && in.Provider == "mock" && !s.allowMock {
@@ -238,7 +327,11 @@ func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domai
 // recorded as succeeded instead. Safe with many replicas: each payment is
 // re-checked under a row lock and only a real status change publishes.
 func (s *Service) ExpiryWorker(ctx context.Context) {
-	t := time.NewTicker(15 * time.Second)
+	every := s.ExpiryEvery
+	if every <= 0 {
+		every = 15 * time.Second
+	}
+	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		select {
@@ -381,7 +474,8 @@ func toAPI(p *domain.Payment) payments.Payment {
 	}
 	return payments.Payment{
 		ID: p.ID, MerchantID: p.MerchantID, Environment: p.Environment, Amount: p.Amount, Fee: p.Fee,
-		RefundedAmount: p.RefundedAmount, Currency: p.Currency, Status: string(p.Status), Provider: p.Provider,
+		RefundedAmount: p.RefundedAmount, Currency: p.Currency, Status: string(p.Status),
+		PaymentMethod: p.PaymentMethod, Provider: p.Provider,
 		ProviderRef: p.ProviderRef, Reference: p.Reference, Description: p.Description, Metadata: meta,
 		CustomerEmail: p.CustomerEmail, CustomerName: p.CustomerName, ReturnURL: p.ReturnURL,
 		CheckoutURL: p.CheckoutURL, FailureReason: p.FailureReason, ExpiresAt: p.ExpiresAt,

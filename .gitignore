@@ -1,0 +1,39 @@
+# ---- Secrets: never commit ----
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+
+# ---- Build output ----
+/bin/
+/dist/
+/paygate
+/edge
+/loadtest
+*.exe
+*.test
+*.out
+coverage.*
+
+# ---- Go ----
+/vendor/
+go.work
+go.work.sum
+
+# ---- Local data & logs ----
+*.log
+/tmp/
+/pgdata/
+
+# ---- Editors & OS ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Tooling ----
+.claude/

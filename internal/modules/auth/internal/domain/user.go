@@ -40,9 +40,16 @@ type User struct {
 	FailedLogins int
 	LockedUntil  *time.Time
 	LastLoginAt  *time.Time
-	CreatedBy    string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// EmailVerifiedAt is nil until ownership of the email is proven.
+	EmailVerifiedAt *time.Time
+	Phone           string
+	PhoneVerifiedAt *time.Time
+	TOTPSecret      string // encrypted
+	TOTPEnabledAt   *time.Time
+	TOTPLastStep    int64
+	CreatedBy       string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type NewUserInput struct {
@@ -82,6 +89,44 @@ func (u *User) Principal(roles []*Role, c Catalog) reqctx.Principal {
 		p.Role = roles[0].Name
 	}
 	return p
+}
+
+// NewExternalUser: a user who signs in with Google / Apple. No password is set
+// (password login is impossible until they set one with a password reset).
+func NewExternalUser(email, name, merchantID string, now time.Time) (*User, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if a, err := mail.ParseAddress(email); err != nil || a.Address != email {
+		return nil, apperror.Invalid("invalid_email", "the identity provider did not share a valid email")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = strings.Split(email, "@")[0]
+	}
+	if len(name) > 100 {
+		name = name[:100]
+	}
+	return &User{ID: uuid.NewString(), Email: email, Name: name, MerchantID: merchantID,
+		Status: StatusActive, EmailVerifiedAt: &now, CreatedAt: now, UpdatedAt: now}, nil
+}
+
+func (u *User) HasPassword() bool { return u.PasswordHash != "" }
+
+// Verified: the user proved they own the email or the phone of the account.
+func (u *User) Verified() bool { return u.EmailVerifiedAt != nil || u.PhoneVerifiedAt != nil }
+
+// VerificationExempt: platform staff are created by administrators only.
+func (u *User) VerificationExempt() bool { return u.MerchantID == "" }
+
+func (u *User) MFAEnabled() bool { return u.TOTPEnabledAt != nil }
+
+// NewResetToken returns the raw token (emailed once) and its hash (stored).
+func NewResetToken() (raw, hash string, err error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", "", err
+	}
+	raw = "prt_" + base64.RawURLEncoding.EncodeToString(b)
+	return raw, HashRefreshToken(raw), nil
 }
 
 // Audience: merchant team member or platform staff.

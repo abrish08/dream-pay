@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +20,11 @@ import (
 	"paygate/internal/app"
 	"paygate/internal/platform/config"
 	"paygate/internal/platform/database"
+	"paygate/internal/platform/mail"
 	"paygate/internal/platform/secrets"
+	"paygate/internal/platform/sms"
+
+	"gorm.io/gorm"
 )
 
 // TestPaymentFlow runs the whole gateway in-process against a real Postgres:
@@ -41,6 +46,7 @@ func TestPaymentFlow(t *testing.T) {
 	hooks := &receiver{}
 	hookSrv := httptest.NewServer(hooks)
 	defer hookSrv.Close()
+	outbox := &mail.Memory{}
 
 	cfg := config.Config{
 		DatabaseURL: dbURL, DBMaxConns: 5, Bus: "memory",
@@ -48,6 +54,7 @@ func TestPaymentFlow(t *testing.T) {
 		AuthKeyCacheTTL:     0, // revocation takes effect immediately in this test
 		BootstrapAdminEmail: "admin@paygate.test", BootstrapAdminPassword: "admin-password-123",
 		EncryptionKey: bytes.Repeat([]byte{1}, 32), PublicBaseURL: srv.URL, AllowInsecureWebhooks: true,
+		Mailer: outbox,
 	}
 	ctx := context.Background()
 	a, err := app.Build(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -60,7 +67,7 @@ func TestPaymentFlow(t *testing.T) {
 	defer a.Stop(ctx)
 	handler = a.Handler()
 
-	c := &client{t: t, base: srv.URL}
+	c := &client{t: t, base: srv.URL, outbox: outbox}
 
 	// Platform admin (bootstrapped) logs in and onboards a merchant and its owner.
 	c.admin = c.login("admin@paygate.test", "admin-password-123", 200)["access_token"].(string)
@@ -90,7 +97,7 @@ func TestPaymentFlow(t *testing.T) {
 		t.Fatal("idempotent replay returned a different payment")
 	}
 	c.do("POST", "/v1/payments", key, "idem-1", map[string]any{"amount": 1, "currency": "ETB", "provider": "mock", "reference": "x"}, 409)
-	c.do("POST", "/v1/payments", key, "idem-2", map[string]any{"amount": 1, "currency": "ETB", "provider": "chapa", "reference": "x"}, 400) // test key + real provider
+	c.do("POST", "/v1/payments", key, "idem-2", map[string]any{"amount": 1, "currency": "ETB", "provider": "telebirr", "reference": "x"}, 400) // test key + real provider
 
 	// Customer pays; events propagate.
 	resp, err := http.PostForm(p["checkout_url"].(string), url.Values{"result": {"success"}})
@@ -186,12 +193,12 @@ func (c *client) authChecks(mid, owner, ownerRefresh, key string) {
 	c.do("POST", "/v1/team/members", owner, "", map[string]any{"email": "viewer@shop.test", "name": "V", "password": "viewer-password-123", "role": "viewer"}, 201)
 	devID := c.do("POST", "/v1/team/members", owner, "", map[string]any{"email": "dev@shop.test", "name": "D", "password": "dev-password-1234", "role": "developer"}, 201)["id"].(string)
 	c.do("POST", "/v1/team/members", owner, "", map[string]any{"email": "x@shop.test", "name": "X", "password": "x-password-12345", "role": "super_admin"}, 400)
-	viewer := c.login("viewer@shop.test", "viewer-password-123", 200)["access_token"].(string)
+	viewer := c.loginVerified("viewer@shop.test", "viewer-password-123")["access_token"].(string)
 	c.do("GET", "/v1/payments", viewer, "", nil, 200)
 	c.do("GET", "/v1/balance?currency=ETB&environment=test", viewer, "", nil, 200)
 	c.do("POST", "/v1/api-keys", viewer, "", map[string]any{"name": "x", "scopes": []string{"payments:read"}}, 403)
 	c.do("POST", "/v1/team/members", viewer, "", map[string]any{"email": "y@shop.test", "name": "Y", "password": "y-password-12345", "role": "owner"}, 403)
-	dev := c.login("dev@shop.test", "dev-password-1234", 200)["access_token"].(string)
+	dev := c.loginVerified("dev@shop.test", "dev-password-1234")["access_token"].(string)
 	c.do("POST", "/v1/api-keys", dev, "", map[string]any{"name": "x", "scopes": []string{"refunds:write"}}, 403)
 	c.do("POST", "/v1/api-keys", dev, "", map[string]any{"name": "x", "scopes": []string{"payments:write"}}, 201)
 	if me := c.do("GET", "/auth/me", dev, "", nil, 200); me["role"] != "developer" || me["merchant_id"] != mid {
@@ -291,7 +298,7 @@ func (c *client) rbacChecks(owner, dev, devID string) {
 	// Anti-escalation: an admin cannot hand out or touch the owner role.
 	adminID := c.do("POST", "/v1/team/members", owner, "", map[string]any{"email": "adm@shop.test", "name": "A",
 		"password": "adm-password-12345", "roles": []string{"admin"}}, 201)["id"].(string)
-	adm := c.login("adm@shop.test", "adm-password-12345", 200)["access_token"].(string)
+	adm := c.loginVerified("adm@shop.test", "adm-password-12345")["access_token"].(string)
 	c.do("POST", "/v1/team/members/"+devID+"/roles", adm, "", map[string]any{"role": "owner"}, 403)
 	c.do("POST", "/v1/team/members", adm, "", map[string]any{"email": "o2@shop.test", "name": "O",
 		"password": "o2-password-12345", "roles": []string{"owner"}}, 403)
@@ -341,9 +348,43 @@ func resetSchemas(t *testing.T, dbURL string) {
 }
 
 type client struct {
-	t     *testing.T
-	base  string
-	admin string // platform admin's access token
+	t       *testing.T
+	base    string
+	admin   string // platform admin's access token
+	hookURL string // test webhook receiver
+	outbox  *mail.Memory
+	texts   *sms.Memory
+}
+
+var codeRe = regexp.MustCompile(`code: ([0-9]{6})`)
+
+// code returns the newest 6-digit verification code emailed to the address.
+func (c *client) code(email string) string {
+	c.t.Helper()
+	var code string
+	c.eventually("verification email to "+email, func() bool {
+		m, ok := c.outbox.Last(email)
+		if !ok {
+			return false
+		}
+		if mm := codeRe.FindStringSubmatch(m.Subject); mm != nil {
+			code = mm[1]
+			return true
+		}
+		return false
+	})
+	return code
+}
+
+// loginVerified logs in a user who still has to verify their account: the
+// first login answers 403 and emails a code; the code completes the login.
+func (c *client) loginVerified(email, password string) map[string]any {
+	c.t.Helper()
+	e := c.login(email, password, 403)["error"].(map[string]any)
+	if e["code"] != "verification_required" {
+		c.t.Fatalf("want verification_required, got %v", e)
+	}
+	return c.do("POST", "/auth/verify", "", "", map[string]any{"email": email, "code": c.code(email)}, 200)
 }
 
 func (c *client) login(email, password string, want int) map[string]any {
@@ -409,6 +450,7 @@ type receiver struct {
 	secret string
 	calls  int
 	bad    int
+	byType map[string]int
 }
 
 func (r *receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -427,6 +469,10 @@ func (r *receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
+	if r.byType == nil {
+		r.byType = map[string]int{}
+	}
+	r.byType[req.Header.Get("Paygate-Event-Type")]++
 	expected := secrets.HMACHex([]byte(r.secret), append([]byte(fmt.Sprintf("%d.", ts)), body...))
 	if !secrets.EqualHex(sig, expected) || time.Since(time.Unix(ts, 0)) > 5*time.Minute {
 		r.bad++
@@ -436,6 +482,31 @@ func (r *receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 func (r *receiver) count() int         { r.mu.Lock(); defer r.mu.Unlock(); return r.calls }
 func (r *receiver) badSignatures() int { r.mu.Lock(); defer r.mu.Unlock(); return r.bad }
+func (r *receiver) setSecret(s string) { r.mu.Lock(); defer r.mu.Unlock(); r.secret = s }
+
+func (r *receiver) types() map[string]int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := map[string]int{}
+	for k, v := range r.byType {
+		out[k] = v
+	}
+	return out
+}
+
+func openTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := database.Open(os.Getenv("TEST_DATABASE_URL"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	return db
+}
 
 // TestPepperRotation: keys created under the old API key pepper keep working
 // after the pepper is rotated, and are re-hashed with the new one on use.

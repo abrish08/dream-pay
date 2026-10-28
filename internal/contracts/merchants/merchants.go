@@ -17,12 +17,15 @@ const (
 var ErrNotFound = apperror.NotFound("merchant_not_found", "merchant not found")
 
 type Merchant struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Email     string    `json:"email"`
-	Status    string    `json:"status"`
-	FeeBPS    int64     `json:"fee_bps"` // platform fee in basis points: 150 = 1.5%
-	CreatedAt time.Time `json:"created_at"`
+	ID         string     `json:"id"`
+	Name       string     `json:"name"`
+	Email      string     `json:"email"`
+	Phone      string     `json:"phone,omitempty"`
+	Website    string     `json:"website,omitempty"`
+	Status     string     `json:"status"`
+	FeeBPS     int64      `json:"fee_bps"` // platform fee in basis points: 150 = 1.5%
+	ApprovedAt *time.Time `json:"approved_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 // ---- Requests ----
@@ -34,6 +37,18 @@ type GetMerchant struct {
 }
 
 func (GetMerchant) Route() string { return "merchants.get" }
+
+// CreateMerchant registers a self-signed-up merchant (status pending). Sent by
+// the auth service during signup.
+type CreateMerchant struct {
+	bus.Returns[Merchant]
+	Name    string `json:"name"`
+	Email   string `json:"email"`
+	Phone   string `json:"phone"`
+	Website string `json:"website"`
+}
+
+func (CreateMerchant) Route() string { return "merchants.create" }
 
 // ---- Events ----
 

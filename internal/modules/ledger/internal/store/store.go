@@ -57,6 +57,17 @@ func (s *Store) Post(q *gorm.DB, p domain.Posting, now time.Time) (bool, error) 
 	return true, q.Create(&entries).Error
 }
 
+// LockAccount serialises balance checks on one account (transaction-scoped).
+func (s *Store) LockAccount(q *gorm.DB, account, currency string) error {
+	return q.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "ledger:"+account+":"+currency).Error
+}
+
+func (s *Store) Posted(q *gorm.DB, reference string) (bool, error) {
+	var n int64
+	err := q.Model(&txRecord{}).Where("reference = ?", reference).Count(&n).Error
+	return n > 0, err
+}
+
 // Balance of a credit-normal account (what we owe): credits - debits.
 func (s *Store) Balance(q *gorm.DB, account, currency string) (int64, error) {
 	var v int64

@@ -45,8 +45,12 @@ func (m *Module) RegisterRoutes(r module.Routers) {
 	h.RegisterAdmin(r.Admin)
 }
 
-// Subscribes: payments.PaymentSucceeded, refunds.RefundSucceeded
+// Handles: ledger.ReserveFunds.
+// Subscribes: payments.PaymentSucceeded, refunds.RefundSucceeded, payouts.PayoutPaid, payouts.PayoutFailed
 func (m *Module) RegisterHandlers(b bus.Bus) {
+	bus.Handle(b, m.svc.ReserveFunds)
+	bus.On(b, "ledger.on_payout_paid", m.svc.OnPayoutPaid)
+	bus.On(b, "ledger.on_payout_failed", m.svc.OnPayoutFailed)
 	bus.On(b, "ledger.on_payment_succeeded", m.svc.OnPaymentSucceeded)
 	bus.On(b, "ledger.on_refund_succeeded", m.svc.OnRefundSucceeded)
 }

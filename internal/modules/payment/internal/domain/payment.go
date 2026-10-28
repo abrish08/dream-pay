@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"paygate/internal/contracts/payments"
+	"paygate/internal/contracts/providers"
 	"paygate/internal/platform/apperror"
 	"paygate/internal/platform/database"
 	"paygate/internal/platform/money"
@@ -52,6 +53,7 @@ type Payment struct {
 	RefundedAmount int64
 	Currency       string
 	Status         Status
+	PaymentMethod  string
 	Provider       string
 	ProviderRef    string
 	Reference      string
@@ -76,7 +78,8 @@ type NewPaymentInput struct {
 	RequestHash    string
 	Amount         int64
 	Currency       string
-	Provider       string
+	Method         string // optional: empty = the customer picks on the hosted page
+	Provider       string // optional, legacy: explicit provider
 	Reference      string
 	Description    string
 	Metadata       map[string]string
@@ -100,8 +103,9 @@ func NewPayment(in NewPaymentInput, feeBPS int64, now time.Time) (*Payment, erro
 		return nil, apperror.Invalid("invalid_amount", "amount must be a positive integer in minor units")
 	case !money.Supported(in.Currency):
 		return nil, apperror.Invalid("unsupported_currency", "currency must be ETB or USD")
-	case strings.TrimSpace(in.Provider) == "":
-		return nil, apperror.Invalid("invalid_provider", "provider is required")
+	case in.Method != "" && !providers.ValidMethod(in.Method):
+		return nil, apperror.Invalid("invalid_payment_method",
+			"payment_method must be one of: "+strings.Join(providers.Methods, ", "))
 	case strings.TrimSpace(in.Reference) == "" || len(in.Reference) > 100:
 		return nil, apperror.Invalid("invalid_reference", "reference is required (max 100 characters)")
 	}
@@ -116,6 +120,9 @@ func NewPayment(in NewPaymentInput, feeBPS int64, now time.Time) (*Payment, erro
 	if err := validateMetadata(in.Metadata); err != nil {
 		return nil, err
 	}
+	if in.Metadata == nil {
+		in.Metadata = map[string]string{}
+	}
 	if in.ReturnURL != "" {
 		if u, err := url.Parse(in.ReturnURL); err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
 			return nil, apperror.Invalid("invalid_return_url", "return_url must be an absolute http(s) URL")
@@ -127,7 +134,7 @@ func NewPayment(in NewPaymentInput, feeBPS int64, now time.Time) (*Payment, erro
 	return &Payment{
 		ID: uuid.NewString(), MerchantID: in.MerchantID, Environment: in.Environment,
 		Amount: in.Amount, Fee: CalculateFee(in.Amount, feeBPS), Currency: in.Currency,
-		Status: Pending, Provider: in.Provider, Reference: strings.TrimSpace(in.Reference),
+		Status: Pending, PaymentMethod: in.Method, Provider: in.Provider, Reference: strings.TrimSpace(in.Reference),
 		Description: strings.TrimSpace(in.Description), Metadata: in.Metadata,
 		CustomerEmail: in.CustomerEmail, CustomerName: in.CustomerName, ReturnURL: in.ReturnURL,
 		IdempotencyKey: in.IdempotencyKey, RequestHash: in.RequestHash,
@@ -147,11 +154,26 @@ func (p *Payment) TransitionTo(next Status, now time.Time) error {
 	return nil
 }
 
-func (p *Payment) StartProcessing(providerRef, checkoutURL string, now time.Time) error {
+// StartProcessing records where the checkout was routed.
+func (p *Payment) StartProcessing(provider, providerRef, checkoutURL string, now time.Time) error {
 	if err := p.TransitionTo(Processing, now); err != nil {
 		return err
 	}
-	p.ProviderRef, p.CheckoutURL = providerRef, checkoutURL
+	p.Provider, p.ProviderRef, p.CheckoutURL = provider, providerRef, checkoutURL
+	return nil
+}
+
+// ChooseMethod: the customer picked a method on the hosted checkout page.
+func (p *Payment) ChooseMethod(method string, now time.Time) error {
+	switch {
+	case p.Status != Pending:
+		return apperror.Conflict("payment_not_open", "this payment is no longer waiting for a payment method")
+	case !now.Before(p.ExpiresAt):
+		return apperror.Conflict("payment_expired", "this payment has expired")
+	case !providers.ValidMethod(method):
+		return apperror.Invalid("invalid_payment_method", "unknown payment method")
+	}
+	p.PaymentMethod, p.UpdatedAt = method, now
 	return nil
 }
 

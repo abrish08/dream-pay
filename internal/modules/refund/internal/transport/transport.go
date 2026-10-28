@@ -21,7 +21,24 @@ func NewHTTP(svc *service.Service, log *slog.Logger) *HTTP { return &HTTP{svc: s
 
 func (h *HTTP) RegisterPublic(r chi.Router) {
 	r.With(httpx.Require(refunds.PermWrite, h.log)).Post("/refunds", h.create)
+	r.With(httpx.Require(payments.PermRead, h.log)).Get("/refunds", h.list)
 	r.With(httpx.Require(payments.PermRead, h.log)).Get("/refunds/{id}", h.get)
+}
+
+// list: GET /v1/refunds?payment_id=&limit=&starting_after=
+func (h *HTTP) list(w http.ResponseWriter, r *http.Request) {
+	p, q := httpx.Principal(r), r.URL.Query()
+	env := p.Environment
+	if env == "" {
+		env = q.Get("environment")
+	}
+	page, err := h.svc.List(r.Context(), p.MerchantID, env, q.Get("payment_id"), q.Get("starting_after"),
+		httpx.QueryInt(r, "limit", 20, 100))
+	if err != nil {
+		httpx.WriteError(w, r, h.log, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, page)
 }
 
 func (h *HTTP) create(w http.ResponseWriter, r *http.Request) {

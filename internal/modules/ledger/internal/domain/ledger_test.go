@@ -10,7 +10,7 @@ import (
 func TestPostingsBalance(t *testing.T) {
 	captured := PaymentCaptured(payments.PaymentSucceeded{
 		PaymentID: "p1", MerchantID: "m1", Environment: "live", Amount: 150_000, Fee: 2_250,
-		Currency: "ETB", Provider: "chapa",
+		Currency: "ETB", Provider: "telebirr",
 	})
 	if err := captured.Validate(); err != nil {
 		t.Fatal(err)
@@ -20,13 +20,13 @@ func TestPostingsBalance(t *testing.T) {
 	}
 
 	zeroFee := PaymentCaptured(payments.PaymentSucceeded{PaymentID: "p2", MerchantID: "m1", Environment: "live",
-		Amount: 100, Currency: "ETB", Provider: "chapa"})
+		Amount: 100, Currency: "ETB", Provider: "telebirr"})
 	if err := zeroFee.Validate(); err != nil || len(zeroFee.Lines) != 2 {
 		t.Fatalf("zero fee posting: %v, lines %d", err, len(zeroFee.Lines))
 	}
 
 	refund := RefundSucceeded(refunds.RefundSucceeded{RefundID: "r1", PaymentID: "p1", MerchantID: "m1",
-		Environment: "live", Amount: 30_000, Currency: "ETB", Provider: "chapa"})
+		Environment: "live", Amount: 30_000, Currency: "ETB", Provider: "telebirr"})
 	if err := refund.Validate(); err != nil {
 		t.Fatal(err)
 	}

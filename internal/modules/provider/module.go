@@ -5,15 +5,17 @@ package provider
 import (
 	"embed"
 	"log/slog"
+	"slices"
 
 	"gorm.io/gorm"
 
+	authc "paygate/internal/contracts/auth"
+	"paygate/internal/contracts/providers"
 	"paygate/internal/modules/provider/internal/gateway"
 	"paygate/internal/modules/provider/internal/service"
 	"paygate/internal/modules/provider/internal/store"
 	"paygate/internal/modules/provider/internal/transport"
 	"paygate/internal/platform/bus"
-	"paygate/internal/platform/config"
 	"paygate/internal/platform/module"
 )
 
@@ -23,11 +25,12 @@ var migrations embed.FS
 const Name = "provider"
 
 type Deps struct {
-	DB            *gorm.DB
-	Bus           bus.Bus
-	Log           *slog.Logger
-	PublicBaseURL string
-	Chapa         config.ChapaConfig
+	DB              *gorm.DB
+	Bus             bus.Bus
+	Log             *slog.Logger
+	PublicBaseURL   string
+	Routes          map[string][]string // payment method -> providers in order
+	AllowMockInLive bool
 }
 
 type Module struct {
@@ -41,21 +44,38 @@ func New(d Deps) *Module {
 	base := module.NewBase(Name, d.DB, d.Bus, d.Log, module.MigrationsFS(migrations))
 	st := store.New(d.DB)
 
-	var others []gateway.Gateway
-	if d.Chapa.SecretKey != "" {
-		others = append(others, gateway.NewChapa(d.Chapa.BaseURL, d.Chapa.SecretKey, d.Chapa.WebhookSecret))
-	}
-	// telebirr, CBE Birr, Stripe...: implement gateway.Gateway and append here.
+	base.AddStartTask("register permissions", authc.RegisterTask(d.Bus, Name, providers.Permissions))
 
-	svc := service.New(st, base.Events, gateway.NewMock(st, d.PublicBaseURL), others, d.PublicBaseURL, base.Log)
+	// Direct provider adapters are added here as each integration is signed
+	// and certified (see docs/PROVIDER_ONBOARDING.md), e.g.
+	//   others = append(others, gateway.NewTelebirr(cfg.Telebirr))
+	// and listed in PROVIDER_ROUTES. Until then live payments report the
+	// method as unavailable; test mode always uses the sandbox.
+	var others []gateway.Gateway
+
+	for method, names := range d.Routes {
+		if !providers.ValidMethod(method) {
+			base.Log.Warn("PROVIDER_ROUTES names an unknown payment method", "method", method)
+		}
+		for _, n := range names {
+			if !slices.ContainsFunc(others, func(g gateway.Gateway) bool { return g.Name() == n }) {
+				base.Log.Warn("PROVIDER_ROUTES names a provider that is not installed", "method", method, "provider", n)
+			}
+		}
+	}
+	router := service.NewRouter(d.Routes, d.AllowMockInLive)
+	svc := service.New(st, base.Events, gateway.NewMock(st, d.PublicBaseURL), others, router, d.PublicBaseURL, base.Log)
 	return &Module{Base: base, svc: svc}
 }
 
 func (m *Module) RegisterRoutes(r module.Routers) {
-	transport.NewHTTP(m.svc, m.Log).RegisterOpen(r.Open)
+	h := transport.NewHTTP(m.svc, m.Log)
+	h.RegisterOpen(r.Open)
+	h.RegisterPublic(r.Public)
+	h.RegisterAdmin(r.Admin)
 }
 
-// Handles: providers.InitiateCheckout, providers.VerifyTransaction, providers.Refund.
+// Handles: providers.InitiateCheckout, ListMethods, VerifyTransaction, Refund.
 // Publishes: providers.TransactionUpdated.
 func (m *Module) RegisterHandlers(b bus.Bus) {
 	transport.RegisterBus(b, m.svc)

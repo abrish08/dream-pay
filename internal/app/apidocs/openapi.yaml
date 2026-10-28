@@ -1,0 +1,1279 @@
+openapi: 3.0.3
+info:
+  title: Paygate API
+  version: "1.1"
+  description: |
+    Payments, refunds, payouts and webhooks.
+
+    * **Auth:** `Authorization: Bearer <API key or access token>`. Servers use an API key
+      (`sk_test_…` / `sk_live_…`); people use the access token from `POST /auth/login`.
+    * **Amounts:** integers in minor units (`150000` = 1,500.00 ETB).
+    * **Idempotency:** money-moving `POST`s need a unique `Idempotency-Key` header.
+    * **Errors:** `{"error": {"kind", "code", "message"}}`.
+servers:
+  - url: http://localhost:8080
+    description: Local
+security:
+  - bearer: []
+tags:
+  - {name: Auth, description: Sign up, log in, tokens, password reset, Google / Apple}
+  - {name: Payments}
+  - {name: Refunds}
+  - {name: Balance & payouts}
+  - {name: Webhooks}
+  - {name: API keys}
+  - {name: Team & roles, description: "Merchant team members and custom roles (logged-in users)"}
+  - {name: Admin - merchants & users}
+  - {name: Admin - roles}
+  - {name: Admin - money}
+  - {name: Hosted pages & providers, description: Called by customers' browsers and by payment providers}
+  - {name: System}
+
+paths:
+  # ---------------- Auth ----------------
+  /auth/signup:
+    post:
+      tags: [Auth]
+      summary: Sign up a merchant (email + password)
+      description: |
+        Creates a **pending** merchant and its owner and sends a **6-digit verification code** (email,
+        or SMS through send.et with `verification_channel: sms` and a phone). **No token until the code
+        is confirmed** with `POST /auth/verify`. Test mode works right after; live mode after staff
+        approval. One account per email: an existing email (password, Google or Apple) is `409 email_taken`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"business_name": "Abebe Coffee PLC", "name": "Abebe Kebede", "email": "abebe@abebecoffee.et", "password": "Str0ng-Passw0rd!2026", "phone": "+251911234567", "website": "https://abebecoffee.et", "verification_channel": "email"}
+            schema:
+              type: object
+              required: [business_name, email, password]
+              properties:
+                business_name: {type: string, example: Abebe Coffee}
+                name: {type: string, example: Abebe Kebede}
+                email: {type: string, format: email}
+                password: {type: string, minLength: 12, maxLength: 128}
+                phone: {type: string, example: "+251911000000"}
+                website: {type: string}
+                verification_channel: {type: string, enum: [email, sms], default: email}
+      responses:
+        "201":
+          description: Account created; verification code sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verification_required: {type: boolean, example: true}
+                  email: {type: string}
+                  channel: {type: string, enum: [email, sms]}
+                  message: {type: string}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "429": {$ref: "#/components/responses/Error"}
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in with email and password
+      description: |
+        Returns an access token (5 min) and a refresh token. 5 wrong passwords lock the account for
+        15 minutes (`401 account_locked`).
+        * Account not verified yet: `403 verification_required` and a new code is sent.
+        * Authenticator app enabled: the answer is `{mfa_required: true, mfa_token}`; finish with
+          `POST /auth/login/mfa`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"email": "abebe@abebecoffee.et", "password": "Str0ng-Passw0rd!2026"}
+            schema: {type: object, required: [email, password], properties: {email: {type: string}, password: {type: string}}}
+      responses:
+        "200": {$ref: "#/components/responses/Tokens"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "429": {$ref: "#/components/responses/Error"}
+  /auth/oauth/{provider}:
+    post:
+      tags: [Auth]
+      summary: Sign in / sign up with Google or Apple
+      description: |
+        Your app signs the user in with Google or Apple and sends us the **ID token**.
+        * Linked account: logged in (`200`).
+        * Not linked, but an account uses the same (verified) email: the Google/Apple account is
+          **linked** to it and the user is logged in (`200`) — never a second account. If that
+          account's email was never verified, its password is removed for safety (use
+          *forgot password* to set one again).
+        * No account: send `business_name` to sign up (`201`), otherwise `404 account_not_found`.
+      security: []
+      parameters:
+        - {name: provider, in: path, required: true, schema: {type: string, enum: [google, apple]}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"id_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImV4YW1wbGUifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20ifQ.c2lnbmF0dXJl", "nonce": "n-0S6_WzA2Mj", "business_name": "Abebe Coffee PLC"}
+            schema:
+              type: object
+              required: [id_token]
+              properties:
+                id_token: {type: string, description: ID token from Google / Apple sign-in}
+                nonce: {type: string, description: The nonce your app used (raw or SHA-256), recommended}
+                business_name: {type: string, description: Only to sign up}
+                name: {type: string, description: "Apple sends the name only to your app, on the first sign-in"}
+                phone: {type: string}
+                website: {type: string}
+      responses:
+        "200": {$ref: "#/components/responses/Tokens"}
+        "201": {$ref: "#/components/responses/Tokens"}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+  /auth/verify:
+    post:
+      tags: [Auth]
+      summary: Confirm the 6-digit code; activates the account and logs in
+      description: Codes expire after 15 minutes, work once, and die after 5 wrong tries. Staff accounts and accounts created by staff never need this.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"email": "abebe@abebecoffee.et", "code": "482913"}
+            schema: {type: object, required: [email, code], properties: {email: {type: string}, code: {type: string, example: "482913"}}}
+      responses:
+        "200": {$ref: "#/components/responses/Tokens"}
+        "400": {$ref: "#/components/responses/Error"}
+  /auth/verify/resend:
+    post:
+      tags: [Auth]
+      summary: Send a new verification code
+      description: Always `202` (no account enumeration). At most one code per minute and 5 per hour; a new code replaces the old one.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"email": "abebe@abebecoffee.et", "channel": "email"}
+            schema: {type: object, required: [email], properties: {email: {type: string}, channel: {type: string, enum: [email, sms], default: email}}}
+      responses:
+        "202": {description: A code is on its way if the account is waiting for verification}
+  /auth/login/mfa:
+    post:
+      tags: [Auth]
+      summary: Second sign-in step with the authenticator code (or a recovery code)
+      description: The `mfa_token` from the first step lives 5 minutes and allows 5 tries. A code is accepted only once.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"mfa_token": "mfa_RXhhbXBsZUNoYWxsZW5nZVRva2Vu", "code": "123456"}
+            schema: {type: object, required: [mfa_token, code], properties: {mfa_token: {type: string}, code: {type: string, example: "123456"}}}
+      responses:
+        "200": {$ref: "#/components/responses/Tokens"}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/mfa:
+    get:
+      tags: [Auth]
+      summary: Is the authenticator app enabled; recovery codes left
+      responses:
+        "200":
+          description: Status
+          content: {application/json: {schema: {type: object, properties: {enabled: {type: boolean}, enabled_at: {type: string, format: date-time}, recovery_codes_left: {type: integer}}}}}
+  /auth/mfa/totp/setup:
+    post:
+      tags: [Auth]
+      summary: Start authenticator setup (Microsoft Authenticator, Google Authenticator...)
+      description: Show `otpauth_url` as a QR code (or the `secret` for manual entry), then confirm with the first code.
+      responses:
+        "200":
+          description: Setup
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: {type: string}
+                  otpauth_url: {type: string, example: "otpauth://totp/Paygate:you@shop.com?secret=...&issuer=Paygate"}
+                  issuer: {type: string}
+                  account: {type: string}
+        "409": {$ref: "#/components/responses/Error"}
+  /auth/mfa/totp/confirm:
+    post:
+      tags: [Auth]
+      summary: Confirm setup with a code from the app; returns 10 recovery codes (shown once)
+      requestBody:
+        required: true
+        content: {application/json: {example: {"code": "123456"}, schema: {type: object, required: [code], properties: {code: {type: string}}}}}
+      responses:
+        "200":
+          description: Enabled
+          content: {application/json: {schema: {type: object, properties: {enabled: {type: boolean}, recovery_codes: {type: array, items: {type: string}}, warning: {type: string}}}}}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/mfa/totp/disable:
+    post:
+      tags: [Auth]
+      summary: Turn the authenticator off (password + authenticator or recovery code)
+      requestBody:
+        required: true
+        content: {application/json: {example: {"password": "Str0ng-Passw0rd!2026", "code": "123456"}, schema: {type: object, required: [code], properties: {password: {type: string}, code: {type: string}}}}}
+      responses:
+        "204": {description: Disabled}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: New access token from a refresh token
+      description: The refresh token rotates on every use; re-using an old one signs the user out everywhere (theft detection).
+      security: []
+      requestBody:
+        required: true
+        content: {application/json: {example: {"refresh_token": "rt_RXhhbXBsZVJlZnJlc2hUb2tlbg"}, schema: {type: object, required: [refresh_token], properties: {refresh_token: {type: string}}}}}
+      responses:
+        "200": {$ref: "#/components/responses/Tokens"}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: End a session (revoke the refresh token)
+      security: []
+      requestBody:
+        required: true
+        content: {application/json: {example: {"refresh_token": "rt_RXhhbXBsZVJlZnJlc2hUb2tlbg"}, schema: {type: object, required: [refresh_token], properties: {refresh_token: {type: string}}}}}
+      responses:
+        "204": {description: Logged out}
+  /auth/password/forgot:
+    post:
+      tags: [Auth]
+      summary: Email a password reset link
+      description: Always `202`, whether or not the email has an account (no account enumeration). The link works once and expires (30 minutes by default). At most 3 emails per account per hour.
+      security: []
+      requestBody:
+        required: true
+        content: {application/json: {example: {"email": "abebe@abebecoffee.et"}, schema: {type: object, required: [email], properties: {email: {type: string}}}}}
+      responses:
+        "202": {description: If the account exists, an email is on its way}
+        "429": {$ref: "#/components/responses/Error"}
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Set a new password with the emailed token
+      description: Signs the user out everywhere and emails a "password changed" notice.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"token": "prt_RXhhbXBsZVJlc2V0VG9rZW4", "new_password": "N3w-Str0ng-Passw0rd!"}
+            schema:
+              type: object
+              required: [token, new_password]
+              properties:
+                token: {type: string, example: prt_...}
+                new_password: {type: string, minLength: 12, maxLength: 128}
+      responses:
+        "204": {description: Password changed}
+        "400": {$ref: "#/components/responses/Error"}
+  /auth/password:
+    post:
+      tags: [Auth]
+      summary: Change your password (current password + authenticator code)
+      description: |
+        Needs a code from your authenticator app (Microsoft Authenticator). Without an authenticator
+        set up: `403 mfa_enrollment_required` (use `/auth/mfa/totp/setup` first). Signs you out
+        everywhere and emails a notice.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"current_password": "Str0ng-Passw0rd!2026", "new_password": "N3w-Str0ng-Passw0rd!", "totp_code": "123456"}
+            schema:
+              type: object
+              required: [current_password, new_password, totp_code]
+              properties:
+                current_password: {type: string}
+                new_password: {type: string, minLength: 12}
+                totp_code: {type: string, example: "123456"}
+      responses:
+        "204": {description: Changed}
+        "401": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Who am I (user with roles and permissions, or the API key)
+      responses:
+        "200": {description: Current user, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}
+  /.well-known/jwks.json:
+    get:
+      tags: [Auth]
+      summary: Public keys that verify access tokens (EdDSA)
+      security: []
+      responses:
+        "200": {description: JSON Web Key Set}
+
+  # ---------------- Merchant: payments ----------------
+  /v1/merchant:
+    get:
+      tags: [Payments]
+      summary: Your merchant account (status, fee)
+      responses:
+        "200": {description: Merchant, content: {application/json: {schema: {$ref: "#/components/schemas/Merchant"}}}}
+  /v1/payment-methods:
+    get:
+      tags: [Payments]
+      summary: Payment methods you can offer right now
+      description: Test keys see every method (sandbox). Live methods depend on the providers connected.
+      parameters:
+        - {name: currency, in: query, schema: {type: string, default: ETB}}
+        - {name: environment, in: query, schema: {type: string, enum: [live, test]}, description: Dashboard users only}
+      responses:
+        "200":
+          description: Methods
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        method: {type: string, example: telebirr}
+                        label: {type: string, example: telebirr}
+                        available: {type: boolean}
+  /v1/payments:
+    post:
+      tags: [Payments]
+      summary: Create a payment (payments:write)
+      description: Returns a `checkout_url`; redirect your customer there. Needs an API key.
+      parameters: [{$ref: "#/components/parameters/IdempotencyKey"}]
+      requestBody:
+        required: true
+        content: {application/json: {example: {"amount": 150000, "currency": "ETB", "payment_method": "telebirr", "reference": "ORDER-1001", "description": "2 x Yirgacheffe coffee 500g", "metadata": {"order_id": "1001", "customer_id": "C-77"}, "customer": {"email": "hana@example.com", "name": "Hana Tesfaye"}, "return_url": "https://abebecoffee.et/orders/1001/thanks", "expires_in_minutes": 30}, schema: {$ref: "#/components/schemas/CreatePayment"}}}
+      responses:
+        "201": {description: Created, content: {application/json: {schema: {$ref: "#/components/schemas/Payment"}}}}
+        "200": {description: Replayed (same Idempotency-Key), content: {application/json: {schema: {$ref: "#/components/schemas/Payment"}}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "403": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+        "429": {$ref: "#/components/responses/Error"}
+        "502": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [Payments]
+      summary: List payments (payments:read)
+      parameters:
+        - {name: status, in: query, schema: {type: string}, description: "Comma list, e.g. succeeded,refunded"}
+        - {name: reference, in: query, schema: {type: string}}
+        - {name: created_from, in: query, schema: {type: string, format: date-time}}
+        - {name: created_to, in: query, schema: {type: string, format: date-time}}
+        - {name: environment, in: query, schema: {type: string, enum: [live, test]}, description: Dashboard users only}
+        - {$ref: "#/components/parameters/Limit"}
+        - {$ref: "#/components/parameters/StartingAfter"}
+      responses:
+        "200": {description: One page, content: {application/json: {schema: {$ref: "#/components/schemas/PaymentPage"}}}}
+  /v1/payments/{id}:
+    get:
+      tags: [Payments]
+      summary: Get a payment (payments:read)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {description: Payment, content: {application/json: {schema: {$ref: "#/components/schemas/Payment"}}}}
+        "404": {$ref: "#/components/responses/Error"}
+
+  # ---------------- Refunds ----------------
+  /v1/refunds:
+    post:
+      tags: [Refunds]
+      summary: Refund a payment, fully or partly (refunds:write)
+      parameters: [{$ref: "#/components/parameters/IdempotencyKey"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"payment_id": "7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c", "amount": 50000, "reason": "Customer returned one item"}
+            schema:
+              type: object
+              required: [payment_id]
+              properties:
+                payment_id: {type: string, format: uuid}
+                amount: {type: integer, format: int64, description: "Minor units; omit or 0 to refund everything still refundable"}
+                reason: {type: string}
+      responses:
+        "201": {description: Created (may be pending while the provider answers), content: {application/json: {schema: {$ref: "#/components/schemas/Refund"}}}}
+        "200": {description: Replayed, content: {application/json: {schema: {$ref: "#/components/schemas/Refund"}}}}
+        "422": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [Refunds]
+      summary: List refunds (payments:read)
+      parameters:
+        - {name: payment_id, in: query, schema: {type: string, format: uuid}}
+        - {$ref: "#/components/parameters/Limit"}
+        - {$ref: "#/components/parameters/StartingAfter"}
+      responses:
+        "200": {description: One page, content: {application/json: {schema: {$ref: "#/components/schemas/RefundPage"}}}}
+  /v1/refunds/{id}:
+    get:
+      tags: [Refunds]
+      summary: Get a refund (payments:read)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {description: Refund, content: {application/json: {schema: {$ref: "#/components/schemas/Refund"}}}}
+        "404": {$ref: "#/components/responses/Error"}
+
+  # ---------------- Balance & payouts ----------------
+  /v1/balance:
+    get:
+      tags: [Balance & payouts]
+      summary: Your balance (balance:read)
+      parameters:
+        - {name: currency, in: query, schema: {type: string, default: ETB}}
+        - {name: environment, in: query, schema: {type: string, enum: [live, test]}, description: Dashboard users only}
+      responses:
+        "200":
+          description: Balance
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  currency: {type: string}
+                  environment: {type: string}
+                  available: {type: integer, format: int64, description: Can be paid out}
+                  pending_payouts: {type: integer, format: int64, description: Held for payouts not sent yet}
+  /v1/payouts:
+    post:
+      tags: [Balance & payouts]
+      summary: Request a payout to your bank account (payouts:write, logged-in users only)
+      description: The funds are held at once; you can never request more than `available`.
+      parameters: [{$ref: "#/components/parameters/IdempotencyKey"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"amount": 100000, "currency": "ETB", "environment": "live", "description": "October settlement", "bank_account": {"bank_name": "Commercial Bank of Ethiopia", "account_number": "1000123456789", "account_name": "Abebe Coffee PLC"}}
+            schema:
+              type: object
+              required: [amount, currency, bank_account]
+              properties:
+                amount: {type: integer, format: int64, minimum: 10000}
+                currency: {type: string, example: ETB}
+                environment: {type: string, enum: [live, test], default: live}
+                description: {type: string}
+                bank_account:
+                  type: object
+                  required: [bank_name, account_number, account_name]
+                  properties:
+                    bank_name: {type: string, example: Commercial Bank of Ethiopia}
+                    account_number: {type: string, example: "1000123456789"}
+                    account_name: {type: string, example: Abebe Coffee PLC}
+      responses:
+        "201": {description: Requested, content: {application/json: {schema: {$ref: "#/components/schemas/Payout"}}}}
+        "422": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [Balance & payouts]
+      summary: List your payouts (payouts:read)
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [reserving, requested, paid, failed, rejected]}}
+        - {$ref: "#/components/parameters/Limit"}
+        - {$ref: "#/components/parameters/StartingAfter"}
+      responses:
+        "200": {description: One page, content: {application/json: {schema: {$ref: "#/components/schemas/PayoutPage"}}}}
+  /v1/payouts/{id}:
+    get:
+      tags: [Balance & payouts]
+      summary: Get a payout (payouts:read)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {description: Payout, content: {application/json: {schema: {$ref: "#/components/schemas/Payout"}}}}
+
+  # ---------------- Webhooks ----------------
+  /v1/webhook-endpoints:
+    post:
+      tags: [Webhooks]
+      summary: Register a webhook endpoint (webhooks:write)
+      description: The signing `secret` is returned once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"url": "https://abebecoffee.et/paygate/webhook", "events": ["payment.succeeded", "payment.failed", "refund.succeeded"]}
+            schema:
+              type: object
+              required: [url, events]
+              properties:
+                url: {type: string, example: "https://shop.example.com/paygate/webhook"}
+                events: {type: array, items: {type: string}, example: ["*"]}
+      responses:
+        "201": {description: Created, content: {application/json: {schema: {$ref: "#/components/schemas/WebhookEndpointWithSecret"}}}}
+    get:
+      tags: [Webhooks]
+      summary: List endpoints (webhooks:write)
+      responses:
+        "200": {description: Endpoints, content: {application/json: {schema: {type: object, properties: {data: {type: array, items: {$ref: "#/components/schemas/WebhookEndpoint"}}}}}}}
+  /v1/webhook-endpoints/{id}:
+    delete:
+      tags: [Webhooks]
+      summary: Disable an endpoint (webhooks:write)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"204": {description: Disabled}}
+  /v1/webhook-endpoints/{id}/rotate-secret:
+    post:
+      tags: [Webhooks]
+      summary: Replace the signing secret, shown once (webhooks:write)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {description: New secret, content: {application/json: {schema: {$ref: "#/components/schemas/WebhookEndpointWithSecret"}}}}
+  /v1/webhook-deliveries:
+    get:
+      tags: [Webhooks]
+      summary: Recent deliveries and their status (webhooks:write)
+      parameters: [{$ref: "#/components/parameters/Limit"}]
+      responses: {"200": {description: Deliveries}}
+  /v1/webhook-deliveries/{id}/retry:
+    post:
+      tags: [Webhooks]
+      summary: Send a failed delivery again now (webhooks:write)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "202": {description: Queued}
+        "404": {$ref: "#/components/responses/Error"}
+
+  # ---------------- API keys ----------------
+  /v1/api-keys:
+    post:
+      tags: [API keys]
+      summary: Create an API key (apikeys:manage, logged-in users only)
+      description: The `secret` is shown once. Scopes can only be permissions you hold. Live keys need an approved merchant.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"name": "Production server", "environment": "test", "scopes": ["payments:read", "payments:write", "refunds:write", "balance:read"], "expires_in_days": 365}
+            schema:
+              type: object
+              required: [name, scopes]
+              properties:
+                name: {type: string}
+                environment: {type: string, enum: [test, live], default: test}
+                scopes: {type: array, items: {type: string}, example: [payments:read, payments:write, refunds:write, balance:read]}
+                expires_in_days: {type: integer}
+      responses:
+        "201": {description: Key with its secret (shown once), content: {application/json: {schema: {$ref: "#/components/schemas/APIKeyWithSecret"}}}}
+        "403": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [API keys]
+      summary: List keys, without secrets (apikeys:manage)
+      responses:
+        "200": {description: Keys, content: {application/json: {schema: {type: object, properties: {data: {type: array, items: {$ref: "#/components/schemas/APIKey"}}}}}}}
+  /v1/api-keys/{id}:
+    delete:
+      tags: [API keys]
+      summary: Revoke a key (apikeys:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"204": {description: Revoked}}
+  /v1/api-keys/{id}/roll:
+    post:
+      tags: [API keys]
+      summary: Replace a key; the old one works for grace_hours (apikeys:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody:
+        content: {application/json: {example: {"grace_hours": 24, "expires_in_days": 365}, schema: {type: object, properties: {grace_hours: {type: integer, default: 24}, expires_in_days: {type: integer}}}}}
+      responses:
+        "201": {description: New key with its secret, content: {application/json: {schema: {$ref: "#/components/schemas/APIKeyWithSecret"}}}}
+
+  # ---------------- Team & roles (merchant) ----------------
+  /v1/team/members:
+    post:
+      tags: [Team & roles]
+      summary: Add a team member with roles (team:manage)
+      requestBody: {$ref: "#/components/requestBodies/CreateUser"}
+      responses:
+        "201": {description: User, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}
+        "403": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [Team & roles]
+      summary: List team members (team:manage)
+      responses: {"200": {$ref: "#/components/responses/Users"}}
+  /v1/team/members/{id}:
+    delete:
+      tags: [Team & roles]
+      summary: Disable a team member, signed out everywhere (team:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"204": {description: Disabled}, "403": {$ref: "#/components/responses/Error"}}
+  /v1/team/members/{id}/roles:
+    post:
+      tags: [Team & roles]
+      summary: Assign a role (team:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody: {$ref: "#/components/requestBodies/AssignRole"}
+      responses: {"200": {description: User, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}, "403": {$ref: "#/components/responses/Error"}}
+  /v1/team/members/{id}/roles/{roleId}:
+    delete:
+      tags: [Team & roles]
+      summary: Remove a role (team:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}, {$ref: "#/components/parameters/RoleId"}]
+      responses: {"200": {description: User, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}}
+  /v1/permissions:
+    get:
+      tags: [Team & roles]
+      summary: Permissions a merchant role can contain (roles:read)
+      responses: {"200": {$ref: "#/components/responses/Permissions"}}
+  /v1/roles:
+    get:
+      tags: [Team & roles]
+      summary: Built-in and your custom roles (roles:read)
+      responses: {"200": {$ref: "#/components/responses/Roles"}}
+    post:
+      tags: [Team & roles]
+      summary: Create a custom role from permissions (roles:manage)
+      requestBody: {$ref: "#/components/requestBodies/CreateRole"}
+      responses: {"201": {$ref: "#/components/responses/Role"}, "403": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}}
+  /v1/roles/{id}:
+    get:
+      tags: [Team & roles]
+      summary: Get a role (roles:read)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {$ref: "#/components/responses/Role"}}
+    patch:
+      tags: [Team & roles]
+      summary: Rename / describe a custom role (roles:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody: {$ref: "#/components/requestBodies/UpdateRole"}
+      responses: {"200": {$ref: "#/components/responses/Role"}}
+    delete:
+      tags: [Team & roles]
+      summary: Delete a custom role that nobody holds (roles:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"204": {description: Deleted}, "409": {$ref: "#/components/responses/Error"}}
+  /v1/roles/{id}/permissions:
+    post:
+      tags: [Team & roles]
+      summary: Add permissions to a role (roles:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody: {$ref: "#/components/requestBodies/Permissions"}
+      responses: {"200": {$ref: "#/components/responses/Role"}}
+  /v1/roles/{id}/permissions/{code}:
+    delete:
+      tags: [Team & roles]
+      summary: Remove a permission from a role; holders' tokens become stale at once (roles:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}, {$ref: "#/components/parameters/Code"}]
+      responses: {"200": {$ref: "#/components/responses/Role"}}
+  /v1/audit-log:
+    get:
+      tags: [Team & roles]
+      summary: Role, team and account changes (roles:read)
+      responses: {"200": {$ref: "#/components/responses/AuditLog"}}
+
+  # ---------------- Admin: merchants & users ----------------
+  /admin/merchants:
+    post:
+      tags: [Admin - merchants & users]
+      summary: Create an approved merchant (merchants:manage)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"name": "Abebe Coffee PLC", "email": "finance@abebecoffee.et", "phone": "+251911234567", "website": "https://abebecoffee.et", "fee_bps": 150}
+            schema:
+              type: object
+              required: [name, email]
+              properties:
+                name: {type: string}
+                email: {type: string}
+                phone: {type: string}
+                website: {type: string}
+                fee_bps: {type: integer, default: 150}
+      responses: {"201": {description: Merchant, content: {application/json: {schema: {$ref: "#/components/schemas/Merchant"}}}}}
+    get:
+      tags: [Admin - merchants & users]
+      summary: List merchants, e.g. ?status=pending to review signups (merchants:read)
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [pending, active, suspended]}}
+        - {$ref: "#/components/parameters/Limit"}
+        - {$ref: "#/components/parameters/StartingAfter"}
+      responses: {"200": {description: One page of merchants}}
+  /admin/merchants/{id}:
+    get:
+      tags: [Admin - merchants & users]
+      summary: Get a merchant (merchants:read)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {description: Merchant, content: {application/json: {schema: {$ref: "#/components/schemas/Merchant"}}}}}
+    patch:
+      tags: [Admin - merchants & users]
+      summary: Change the fee for future payments (merchants:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody:
+        content: {application/json: {example: {"fee_bps": 120}, schema: {type: object, properties: {fee_bps: {type: integer, minimum: 0, maximum: 10000}}}}}
+      responses: {"200": {description: Merchant, content: {application/json: {schema: {$ref: "#/components/schemas/Merchant"}}}}}
+  /admin/merchants/{id}/status:
+    post:
+      tags: [Admin - merchants & users]
+      summary: Approve (active), suspend or reject a merchant (merchants:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody:
+        content: {application/json: {example: {"status": "active"}, schema: {type: object, required: [status], properties: {status: {type: string, enum: [active, suspended]}}}}}
+      responses: {"200": {description: Merchant, content: {application/json: {schema: {$ref: "#/components/schemas/Merchant"}}}}}
+  /admin/merchants/{id}/api-keys:
+    get:
+      tags: [Admin - merchants & users]
+      summary: A merchant's API keys, no secrets (merchants:read)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {description: Keys}}
+  /admin/merchants/{id}/api-keys/{keyId}:
+    delete:
+      tags: [Admin - merchants & users]
+      summary: Revoke a merchant's key, e.g. reported leak (merchants:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}, {name: keyId, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses: {"204": {description: Revoked}}
+  /admin/users:
+    post:
+      tags: [Admin - merchants & users]
+      summary: Create a staff user or a merchant user (users:manage)
+      requestBody: {required: true, content: {application/json: {example: {"email": "selam@paygate.et", "name": "Selam Bekele", "password": "Selam-Str0ng-Pass!", "roles": ["finance"]}, schema: {$ref: "#/components/schemas/CreateUserBody"}}}}
+      responses: {"201": {description: User, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}}
+    get:
+      tags: [Admin - merchants & users]
+      summary: List staff (or ?merchant_id=) users (users:manage)
+      parameters: [{name: merchant_id, in: query, schema: {type: string, format: uuid}}]
+      responses: {"200": {$ref: "#/components/responses/Users"}}
+  /admin/users/{id}:
+    delete:
+      tags: [Admin - merchants & users]
+      summary: Disable a user (users:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"204": {description: Disabled}}
+  /admin/users/{id}/roles:
+    post:
+      tags: [Admin - merchants & users]
+      summary: Assign a role (users:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody: {required: true, content: {application/json: {example: {"role": "support"}, schema: {$ref: "#/components/schemas/AssignRoleBody"}}}}
+      responses: {"200": {description: User, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}}
+  /admin/users/{id}/roles/{roleId}:
+    delete:
+      tags: [Admin - merchants & users]
+      summary: Remove a role (users:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}, {$ref: "#/components/parameters/RoleId"}]
+      responses: {"200": {description: User, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}}
+
+  # ---------------- Admin: roles ----------------
+  /admin/permissions:
+    get:
+      tags: [Admin - roles]
+      summary: Permissions for platform roles, or ?audience=merchant (roles:read)
+      parameters: [{$ref: "#/components/parameters/Audience"}]
+      responses: {"200": {$ref: "#/components/responses/Permissions"}}
+  /admin/roles:
+    get:
+      tags: [Admin - roles]
+      summary: Platform roles, or ?audience=merchant for the merchant templates (roles:read)
+      parameters: [{$ref: "#/components/parameters/Audience"}]
+      responses: {"200": {$ref: "#/components/responses/Roles"}}
+    post:
+      tags: [Admin - roles]
+      summary: Create a platform role (or merchant template with audience=merchant) (roles:manage)
+      requestBody: {required: true, content: {application/json: {example: {"name": "Auditor", "description": "Read-only access to the books", "permissions": ["ledger:read", "merchants:read"]}, schema: {$ref: "#/components/schemas/CreateRoleBody"}}}}
+      responses: {"201": {$ref: "#/components/responses/Role"}}
+  /admin/roles/{id}:
+    get:
+      tags: [Admin - roles]
+      summary: Get a role (roles:read)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {$ref: "#/components/responses/Role"}}
+    patch:
+      tags: [Admin - roles]
+      summary: Rename / describe a role (roles:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody: {required: true, content: {application/json: {example: {"name": "Auditor", "description": "Read-only books and merchants"}, schema: {$ref: "#/components/schemas/UpdateRoleBody"}}}}
+      responses: {"200": {$ref: "#/components/responses/Role"}}
+    delete:
+      tags: [Admin - roles]
+      summary: Delete a custom role nobody holds (roles:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"204": {description: Deleted}}
+  /admin/roles/{id}/permissions:
+    post:
+      tags: [Admin - roles]
+      summary: Add permissions to a role (roles:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody: {required: true, content: {application/json: {example: {"permissions": ["reconciliation:run"]}, schema: {$ref: "#/components/schemas/PermissionsBody"}}}}
+      responses: {"200": {$ref: "#/components/responses/Role"}}
+  /admin/roles/{id}/permissions/{code}:
+    delete:
+      tags: [Admin - roles]
+      summary: Remove a permission from a role (roles:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}, {$ref: "#/components/parameters/Code"}]
+      responses: {"200": {$ref: "#/components/responses/Role"}}
+  /admin/audit-log:
+    get:
+      tags: [Admin - roles]
+      summary: Platform audit log (roles:read)
+      responses: {"200": {$ref: "#/components/responses/AuditLog"}}
+
+  # ---------------- Admin: money ----------------
+  /admin/payouts:
+    get:
+      tags: [Admin - money]
+      summary: Payouts to process, e.g. ?status=requested (payouts:manage)
+      parameters:
+        - {name: status, in: query, schema: {type: string}}
+        - {name: merchant_id, in: query, schema: {type: string, format: uuid}}
+        - {$ref: "#/components/parameters/Limit"}
+        - {$ref: "#/components/parameters/StartingAfter"}
+      responses: {"200": {description: One page, content: {application/json: {schema: {$ref: "#/components/schemas/PayoutPage"}}}}}
+  /admin/payouts/{id}:
+    get:
+      tags: [Admin - money]
+      summary: Get a payout (payouts:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {description: Payout, content: {application/json: {schema: {$ref: "#/components/schemas/Payout"}}}}}
+  /admin/payouts/{id}/paid:
+    post:
+      tags: [Admin - money]
+      summary: Confirm the bank transfer was sent (payouts:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody:
+        content: {application/json: {example: {"bank_reference": "CBE-FT-2026102800123"}, schema: {type: object, required: [bank_reference], properties: {bank_reference: {type: string}}}}}
+      responses: {"200": {description: Payout, content: {application/json: {schema: {$ref: "#/components/schemas/Payout"}}}}, "409": {$ref: "#/components/responses/Error"}}
+  /admin/payouts/{id}/failed:
+    post:
+      tags: [Admin - money]
+      summary: Transfer failed; release the held funds (payouts:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody:
+        content: {application/json: {example: {"reason": "Beneficiary account closed"}, schema: {type: object, required: [reason], properties: {reason: {type: string}}}}}
+      responses: {"200": {description: Payout, content: {application/json: {schema: {$ref: "#/components/schemas/Payout"}}}}}
+  /admin/ledger/trial-balance:
+    get:
+      tags: [Admin - money]
+      summary: Debits vs credits per currency; must always balance (ledger:read)
+      responses:
+        "200":
+          description: Trial balance
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {type: object, properties: {currency: {type: string}, debits: {type: integer}, credits: {type: integer}, balanced: {type: boolean}}}
+  /admin/reconciliation/runs:
+    post:
+      tags: [Admin - money]
+      summary: Compare our payments with the providers for a period (reconciliation:run)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"from": "2026-10-27T00:00:00Z", "to": "2026-10-28T00:00:00Z"}
+            schema:
+              type: object
+              required: [from, to]
+              properties:
+                from: {type: string, format: date-time}
+                to: {type: string, format: date-time}
+      responses: {"202": {$ref: "#/components/responses/ReconciliationRun"}}
+    get:
+      tags: [Admin - money]
+      summary: Recent reconciliation runs (reconciliation:run)
+      parameters: [{$ref: "#/components/parameters/Limit"}]
+      responses: {"200": {description: Runs}}
+  /admin/reconciliation/runs/{id}:
+    get:
+      tags: [Admin - money]
+      summary: A run and its mismatches (reconciliation:run)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {$ref: "#/components/responses/ReconciliationRun"}}
+  /admin/providers:
+    get:
+      tags: [Admin - money]
+      summary: Provider adapters, live routing and health (providers:read)
+      responses: {"200": {description: Providers and routes}}
+
+  # ---------------- Hosted pages & provider callbacks ----------------
+  /pay/{id}:
+    get:
+      tags: [Hosted pages & providers]
+      summary: Hosted checkout page (customer's browser)
+      description: Shown when a payment is created without payment_method. The customer picks a method.
+      security: []
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {description: HTML page}}
+    post:
+      tags: [Hosted pages & providers]
+      summary: Customer picks a method; redirected to the provider
+      security: []
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            example: {"method": "telebirr"}
+            schema: {type: object, properties: {method: {type: string, enum: [telebirr, cbe_birr, mpesa, card, bank_transfer]}}}
+      responses: {"303": {description: Redirect to the provider's checkout}}
+  /providers/{provider}/callback:
+    post:
+      tags: [Hosted pages & providers]
+      summary: Provider notification (authenticated per provider, then verified with the provider)
+      security: []
+      parameters: [{name: provider, in: path, required: true, schema: {type: string}}]
+      responses: {"200": {description: Received}}
+    get:
+      tags: [Hosted pages & providers]
+      summary: Provider redirect-style notification
+      security: []
+      parameters: [{name: provider, in: path, required: true, schema: {type: string}}]
+      responses: {"200": {description: Received}}
+  /providers/mock/checkout/{txRef}:
+    get:
+      tags: [Hosted pages & providers]
+      summary: Sandbox provider page (test mode)
+      security: []
+      parameters: [{name: txRef, in: path, required: true, schema: {type: string}}]
+      responses: {"200": {description: HTML page}}
+    post:
+      tags: [Hosted pages & providers]
+      summary: Sandbox pay / decline (test mode)
+      security: []
+      parameters: [{name: txRef, in: path, required: true, schema: {type: string}}]
+      requestBody:
+        content: {application/x-www-form-urlencoded: {example: {"result": "success"}, schema: {type: object, properties: {result: {type: string, enum: [success, failed]}}}}}
+      responses: {"200": {description: Result page}, "303": {description: Back to the merchant's return_url}}
+
+  # ---------------- System ----------------
+  /healthz:
+    get:
+      tags: [System]
+      summary: Liveness, modules and bus routes of this process
+      security: []
+      responses: {"200": {description: OK}}
+  /openapi.yaml:
+    get:
+      tags: [System]
+      summary: This document
+      security: []
+      responses: {"200": {description: OpenAPI 3 YAML}}
+  /swagger:
+    get:
+      tags: [System]
+      summary: Swagger UI (try requests from the browser)
+      security: []
+      responses: {"200": {description: HTML page}}
+  /docs:
+    get:
+      tags: [System]
+      summary: Readable API reference
+      security: []
+      responses: {"200": {description: HTML page}}
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: "`sk_test_...` / `sk_live_...` API key for servers, or an access token from login."
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, maxLength: 100}
+      description: Unique per operation (e.g. order id + attempt). Reuse it when retrying.
+    Id: {name: id, in: path, required: true, schema: {type: string, format: uuid}, example: "3f6c2a9e-8d41-4b7e-a0c5-91e2d7f4b8a1"}
+    RoleId: {name: roleId, in: path, required: true, schema: {type: string, format: uuid}, example: "9a1d3c5e-7b2f-4e6a-8c0d-2f4b6d8e0a1c"}
+    Code: {name: code, in: path, required: true, schema: {type: string, example: "refunds:write"}}
+    Limit: {name: limit, in: query, schema: {type: integer, default: 20, maximum: 100}}
+    StartingAfter: {name: starting_after, in: query, schema: {type: string}, description: next_cursor from the previous page}
+    Audience: {name: audience, in: query, schema: {type: string, enum: [platform, merchant], default: platform}}
+  requestBodies:
+    CreateUser:
+      required: true
+      content: {application/json: {example: {"email": "hana@abebecoffee.et", "name": "Hana Tesfaye", "password": "Hana-Str0ng-Pass!", "roles": ["developer"]}, schema: {$ref: "#/components/schemas/CreateUserBody"}}}
+    AssignRole:
+      required: true
+      content: {application/json: {example: {"role": "analyst"}, schema: {$ref: "#/components/schemas/AssignRoleBody"}}}
+    CreateRole:
+      required: true
+      content: {application/json: {example: {"name": "Refund Desk", "description": "Handles customer refunds", "permissions": ["payments:read", "refunds:write"]}, schema: {$ref: "#/components/schemas/CreateRoleBody"}}}
+    UpdateRole:
+      content: {application/json: {example: {"name": "Refund Desk", "description": "Handles customer refunds and disputes"}, schema: {$ref: "#/components/schemas/UpdateRoleBody"}}}
+    Permissions:
+      required: true
+      content: {application/json: {example: {"permissions": ["balance:read"]}, schema: {$ref: "#/components/schemas/PermissionsBody"}}}
+  responses:
+    Error:
+      description: Error
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    Tokens:
+      description: Logged in
+      content: {application/json: {schema: {$ref: "#/components/schemas/Tokens"}}}
+    Users:
+      description: Users
+      content: {application/json: {schema: {type: object, properties: {data: {type: array, items: {$ref: "#/components/schemas/User"}}}}}}
+    Role:
+      description: Role
+      content: {application/json: {schema: {$ref: "#/components/schemas/Role"}}}
+    Roles:
+      description: Roles
+      content: {application/json: {schema: {type: object, properties: {data: {type: array, items: {$ref: "#/components/schemas/Role"}}}}}}
+    Permissions:
+      description: Permissions
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: array
+                items: {type: object, properties: {code: {type: string}, description: {type: string}, module: {type: string}, audience: {type: string}, api_key: {type: boolean}}}
+    AuditLog:
+      description: Newest first
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: array
+                items: {type: object, properties: {id: {type: string}, actor_id: {type: string}, action: {type: string}, target_type: {type: string}, target_id: {type: string}, details: {type: object}, created_at: {type: string, format: date-time}}}
+    ReconciliationRun:
+      description: Run
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              id: {type: string}
+              kind: {type: string}
+              period_start: {type: string, format: date-time}
+              period_end: {type: string, format: date-time}
+              status: {type: string, enum: [pending, running, completed, failed]}
+              checked: {type: integer}
+              mismatched: {type: integer}
+              items: {type: array, items: {type: object}}
+  schemas:
+    Error:
+      type: object
+      example: {"error": {"kind": "invalid", "code": "invalid_amount", "message": "amount must be a positive integer in minor units"}}
+      properties:
+        error:
+          type: object
+          properties:
+            kind: {type: string, example: invalid}
+            code: {type: string, example: invalid_amount}
+            message: {type: string}
+    Tokens:
+      type: object
+      example: {"access_token": "eyJhbGciOiJFZERTQSIsImtpZCI6IjM5NWYzOTJkNjU1OGI3YzUiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiI1ZDJjOGUxYSJ9.c2lnbmF0dXJl", "token_type": "Bearer", "expires_in": 300, "refresh_token": "rt_8Qm2Zr7LkP0sXc9VbN4tHw1yJe6aDf3gUo5iKq", "refresh_expires_at": "2026-11-04T09:15:00Z", "user": {"id": "5d2c8e1a-4b6f-4c3e-9a7d-2e1f0b9c8d7a", "email": "abebe@abebecoffee.et", "name": "Abebe Kebede", "merchant_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "role": "owner", "roles": [{"id": "6e46d4ec-8974-50eb-925b-e42e37cc9cc9", "name": "owner"}], "permissions": ["apikeys:manage", "balance:read", "payments:read", "payments:write", "refunds:write", "roles:manage", "roles:read", "team:manage", "webhooks:write", "payouts:read", "payouts:write"], "status": "active", "last_login_at": "2026-10-28T09:15:00Z", "created_at": "2026-10-01T08:00:00Z"}}
+      properties:
+        access_token: {type: string, description: "JWT (EdDSA), 5 minutes. Carries your roles and permissions."}
+        token_type: {type: string, example: Bearer}
+        expires_in: {type: integer, example: 300}
+        refresh_token: {type: string, example: rt_..., description: "7 days, single use (rotated)"}
+        refresh_expires_at: {type: string, format: date-time}
+        user: {$ref: "#/components/schemas/User"}
+        mfa_required: {type: boolean, description: "True when an authenticator code is needed (no tokens yet)"}
+        mfa_token: {type: string, description: "Send to POST /auth/login/mfa with the code"}
+        mfa_expires_in: {type: integer, example: 300}
+    User:
+      type: object
+      example: {"id": "5d2c8e1a-4b6f-4c3e-9a7d-2e1f0b9c8d7a", "email": "abebe@abebecoffee.et", "name": "Abebe Kebede", "merchant_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "role": "owner", "roles": [{"id": "6e46d4ec-8974-50eb-925b-e42e37cc9cc9", "name": "owner"}], "permissions": ["apikeys:manage", "balance:read", "payments:read", "payments:write", "refunds:write", "roles:manage", "roles:read", "team:manage", "webhooks:write", "payouts:read", "payouts:write"], "status": "active", "last_login_at": "2026-10-28T09:15:00Z", "created_at": "2026-10-01T08:00:00Z"}
+      properties:
+        id: {type: string, format: uuid}
+        email: {type: string}
+        name: {type: string}
+        merchant_id: {type: string, description: Empty for platform staff}
+        role: {type: string, description: Primary role name}
+        roles: {type: array, items: {type: object, properties: {id: {type: string}, name: {type: string}}}}
+        permissions: {type: array, items: {type: string}}
+        status: {type: string, enum: [active, disabled]}
+        last_login_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    Role:
+      type: object
+      example: {"id": "0c9f6a3e-1d2b-4e5f-8a7c-9b0d1e2f3a4b", "name": "Refund Desk", "description": "Handles customer refunds", "audience": "merchant", "merchant_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "built_in": false, "locked": false, "permissions": ["payments:read", "refunds:write"]}
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        description: {type: string}
+        audience: {type: string, enum: [platform, merchant]}
+        merchant_id: {type: string}
+        built_in: {type: boolean}
+        locked: {type: boolean, description: Holds every permission; cannot be edited}
+        permissions: {type: array, items: {type: string}}
+    Merchant:
+      type: object
+      example: {"id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "name": "Abebe Coffee PLC", "email": "finance@abebecoffee.et", "phone": "+251911234567", "website": "https://abebecoffee.et", "status": "active", "fee_bps": 150, "approved_at": "2026-10-02T10:00:00Z", "created_at": "2026-10-01T08:00:00Z"}
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        email: {type: string}
+        phone: {type: string}
+        website: {type: string}
+        status: {type: string, enum: [pending, active, suspended]}
+        fee_bps: {type: integer, description: "Platform fee in basis points (150 = 1.5%)"}
+        approved_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    APIKey:
+      type: object
+      example: {"id": "b7e1c2d3-4f5a-4b6c-8d7e-9f0a1b2c3d4e", "name": "Production server", "prefix": "sk_test_3kTq", "last4": "9fQ2", "environment": "test", "scopes": ["payments:read", "payments:write", "refunds:write", "balance:read"], "status": "active", "expires_at": "2027-10-28T09:15:00Z", "last_used_at": "2026-10-28T09:20:00Z", "created_at": "2026-10-28T09:15:00Z"}
+      properties:
+        id: {type: string}
+        name: {type: string}
+        prefix: {type: string, example: sk_live_3kTq}
+        last4: {type: string}
+        environment: {type: string, enum: [live, test]}
+        scopes: {type: array, items: {type: string}}
+        status: {type: string, enum: [active, expired, revoked]}
+        expires_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    APIKeyWithSecret:
+      allOf:
+        - $ref: "#/components/schemas/APIKey"
+        - {type: object, properties: {secret: {type: string, description: Shown once}, warning: {type: string}}}
+    WebhookEndpoint:
+      type: object
+      example: {"id": "c3d4e5f6-a7b8-4c9d-8e0f-1a2b3c4d5e6f", "url": "https://abebecoffee.et/paygate/webhook", "events": ["payment.succeeded", "payment.failed", "refund.succeeded"], "active": true, "created_at": "2026-10-28T09:30:00Z"}
+      properties:
+        id: {type: string}
+        url: {type: string}
+        events: {type: array, items: {type: string}}
+        active: {type: boolean}
+        created_at: {type: string, format: date-time}
+    WebhookEndpointWithSecret:
+      allOf:
+        - $ref: "#/components/schemas/WebhookEndpoint"
+        - {type: object, properties: {secret: {type: string, example: whsec_...}, warning: {type: string}}}
+    CreatePayment:
+      type: object
+      required: [amount, currency, reference]
+      properties:
+        amount: {type: integer, format: int64, example: 150000}
+        currency: {type: string, enum: [ETB, USD]}
+        payment_method:
+          type: string
+          enum: [telebirr, cbe_birr, mpesa, card, bank_transfer]
+          description: Omit to let the customer choose on the hosted page. See GET /v1/payment-methods.
+        reference: {type: string, maxLength: 100, description: Your order id}
+        description: {type: string, maxLength: 255}
+        metadata:
+          type: object
+          additionalProperties: {type: string}
+          description: Up to 20 keys; returned on the payment and in webhooks
+          example: {order_id: "A-1001"}
+        customer:
+          type: object
+          properties:
+            email: {type: string}
+            name: {type: string}
+        return_url: {type: string, description: Where the customer goes after paying}
+        expires_in_minutes: {type: integer, minimum: 5, maximum: 1440, default: 30}
+    Payment:
+      type: object
+      example: {"id": "7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c", "merchant_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "environment": "test", "amount": 150000, "fee": 2250, "refunded_amount": 0, "currency": "ETB", "status": "processing", "payment_method": "telebirr", "provider": "mock", "reference": "ORDER-1001", "description": "2 x Yirgacheffe coffee 500g", "metadata": {"order_id": "1001", "customer_id": "C-77"}, "checkout_url": "http://localhost:8080/providers/mock/checkout/7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c", "expires_at": "2026-10-28T10:00:00Z", "created_at": "2026-10-28T09:30:00Z", "updated_at": "2026-10-28T09:30:01Z"}
+      properties:
+        id: {type: string, format: uuid}
+        merchant_id: {type: string}
+        environment: {type: string, enum: [live, test]}
+        amount: {type: integer, format: int64}
+        fee: {type: integer, format: int64}
+        refunded_amount: {type: integer, format: int64}
+        currency: {type: string}
+        status: {type: string, enum: [pending, processing, succeeded, failed, expired, partially_refunded, refunded]}
+        payment_method: {type: string}
+        provider: {type: string, description: The provider the method was routed to}
+        reference: {type: string}
+        description: {type: string}
+        metadata: {type: object, additionalProperties: {type: string}}
+        checkout_url: {type: string}
+        failure_reason: {type: string}
+        expires_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    Refund:
+      type: object
+      example: {"id": "d4e5f6a7-b8c9-4d0e-9f1a-2b3c4d5e6f7a", "payment_id": "7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c", "amount": 50000, "currency": "ETB", "status": "succeeded", "reason": "Customer returned one item", "created_at": "2026-10-28T11:00:00Z"}
+      properties:
+        id: {type: string, format: uuid}
+        payment_id: {type: string}
+        amount: {type: integer, format: int64}
+        currency: {type: string}
+        status: {type: string, enum: [pending, succeeded, failed]}
+        reason: {type: string}
+        failure_reason: {type: string}
+        created_at: {type: string, format: date-time}
+    Payout:
+      type: object
+      example: {"id": "e5f6a7b8-c9d0-4e1f-8a2b-3c4d5e6f7a8b", "merchant_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "amount": 100000, "currency": "ETB", "environment": "live", "status": "requested", "bank_name": "Commercial Bank of Ethiopia", "account_number": "•••••••••6789", "account_name": "Abebe Coffee PLC", "created_at": "2026-10-28T12:00:00Z"}
+      properties:
+        id: {type: string, format: uuid}
+        merchant_id: {type: string}
+        amount: {type: integer, format: int64}
+        currency: {type: string}
+        environment: {type: string}
+        status: {type: string, enum: [reserving, requested, paid, failed, rejected]}
+        bank_name: {type: string}
+        account_number: {type: string, description: Masked}
+        account_name: {type: string}
+        bank_reference: {type: string}
+        failure_reason: {type: string}
+        paid_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    PaymentPage:
+      type: object
+      properties:
+        data: {type: array, items: {$ref: "#/components/schemas/Payment"}}
+        has_more: {type: boolean}
+        next_cursor: {type: string}
+    RefundPage:
+      type: object
+      properties:
+        data: {type: array, items: {$ref: "#/components/schemas/Refund"}}
+        has_more: {type: boolean}
+        next_cursor: {type: string}
+    PayoutPage:
+      type: object
+      properties:
+        data: {type: array, items: {$ref: "#/components/schemas/Payout"}}
+        has_more: {type: boolean}
+        next_cursor: {type: string}
+    CreateUserBody:
+      type: object
+      required: [email, name, password]
+      properties:
+        email: {type: string}
+        name: {type: string}
+        password: {type: string, minLength: 12}
+        roles: {type: array, items: {type: string}, description: Role ids or names}
+        role: {type: string, description: Shorthand for one role}
+        merchant_id: {type: string, description: "Staff only: create a user of this merchant (pre-verified); omit for a staff user"}
+    AssignRoleBody:
+      type: object
+      required: [role]
+      properties:
+        role: {type: string, description: Role id or name}
+    CreateRoleBody:
+      type: object
+      required: [name, permissions]
+      properties:
+        name: {type: string}
+        description: {type: string}
+        permissions: {type: array, items: {type: string}}
+        audience: {type: string, enum: [platform, merchant], description: "Staff only: merchant = a template for every merchant"}
+    UpdateRoleBody:
+      type: object
+      properties:
+        name: {type: string}
+        description: {type: string}
+    PermissionsBody:
+      type: object
+      required: [permissions]
+      properties:
+        permissions: {type: array, items: {type: string}}

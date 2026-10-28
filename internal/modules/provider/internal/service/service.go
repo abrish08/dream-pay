@@ -17,6 +17,7 @@ import (
 
 type Service struct {
 	gateways     map[string]gateway.Gateway
+	router       *Router
 	mock         *gateway.Mock
 	store        *store.Store
 	events       events.Publisher
@@ -25,12 +26,13 @@ type Service struct {
 	now          func() time.Time
 }
 
-func New(st *store.Store, pub events.Publisher, mock *gateway.Mock, others []gateway.Gateway, publicBaseURL string, log *slog.Logger) *Service {
+func New(st *store.Store, pub events.Publisher, mock *gateway.Mock, others []gateway.Gateway, router *Router,
+	publicBaseURL string, log *slog.Logger) *Service {
 	gws := map[string]gateway.Gateway{mock.Name(): mock}
 	for _, g := range others {
 		gws[g.Name()] = g
 	}
-	return &Service{gateways: gws, mock: mock, store: st, events: pub, callbackBase: publicBaseURL,
+	return &Service{gateways: gws, router: router, mock: mock, store: st, events: pub, callbackBase: publicBaseURL,
 		log: log, now: func() time.Time { return time.Now().UTC() }}
 }
 
@@ -42,25 +44,46 @@ func (s *Service) gateway(name string) (gateway.Gateway, error) {
 	return g, nil
 }
 
-// InitiateCheckout is idempotent per tx_ref.
+// InitiateCheckout routes the payment method to a provider and starts the
+// checkout there, failing over to the next provider in the route when one is
+// unavailable. Idempotent per tx_ref.
 func (s *Service) InitiateCheckout(ctx context.Context, req providers.InitiateCheckout) (providers.CheckoutResult, error) {
-	g, err := s.gateway(req.Provider)
-	if err != nil {
-		return providers.CheckoutResult{}, err
-	}
 	if t, err := s.store.GetTransaction(s.store.DB(ctx), req.TxRef, false); err == nil {
-		return providers.CheckoutResult{CheckoutURL: t.CheckoutURL, ProviderRef: t.ProviderRef}, nil
+		return providers.CheckoutResult{CheckoutURL: t.CheckoutURL, ProviderRef: t.ProviderRef, Provider: t.Provider}, nil
 	} else if !errors.Is(err, providers.ErrTransactionNotFound) {
 		return providers.CheckoutResult{}, err
 	}
-
-	res, err := g.Initiate(ctx, req, s.callbackBase+"/providers/"+g.Name()+"/callback")
+	candidates, err := s.router.Candidates(s.gateways, s.mock, req)
 	if err != nil {
 		return providers.CheckoutResult{}, err
 	}
+	var (
+		g       gateway.Gateway
+		res     providers.CheckoutResult
+		lastErr error
+	)
+	for _, cand := range candidates {
+		res, lastErr = cand.Initiate(ctx, req, s.callbackBase+"/providers/"+cand.Name()+"/callback")
+		if lastErr == nil {
+			s.router.Success(cand.Name())
+			g = cand
+			break
+		}
+		if !Retryable(lastErr) {
+			return providers.CheckoutResult{}, lastErr
+		}
+		s.router.Failure(cand.Name(), lastErr)
+		s.log.Warn("provider unavailable, trying next", "provider", cand.Name(), "method", req.Method,
+			"tx_ref", req.TxRef, "err", lastErr)
+	}
+	if g == nil {
+		return providers.CheckoutResult{}, providers.ErrProviderUnavailable.WithMessage(
+			"every provider for " + req.Method + " is unavailable: " + lastErr.Error())
+	}
+	res.Provider = g.Name()
 	now := s.now()
 	err = s.store.CreateTransaction(s.store.DB(ctx), &store.Transaction{
-		TxRef: req.TxRef, Provider: g.Name(), ProviderRef: res.ProviderRef, Amount: req.Amount,
+		TxRef: req.TxRef, Provider: g.Name(), Method: req.Method, ProviderRef: res.ProviderRef, Amount: req.Amount,
 		Currency: req.Currency, Status: providers.StatusPending, CheckoutURL: res.CheckoutURL,
 		ReturnURL: req.ReturnURL, CreatedAt: now, UpdatedAt: now,
 	})
@@ -99,6 +122,22 @@ func (s *Service) Refund(ctx context.Context, req providers.Refund) (providers.R
 	})
 	return res, err
 }
+
+// ListMethods: methods and whether they can be used right now.
+func (s *Service) ListMethods(_ context.Context, q providers.ListMethods) ([]providers.MethodInfo, error) {
+	if q.Currency == "" {
+		q.Currency = "ETB"
+	}
+	out := make([]providers.MethodInfo, 0, len(providers.Methods))
+	for _, m := range providers.Methods {
+		names, ok := s.router.Available(s.gateways, s.mock, q.Environment, m, q.Currency)
+		out = append(out, providers.MethodInfo{Method: m, Label: providers.MethodLabels[m], Available: ok, Providers: names})
+	}
+	return out, nil
+}
+
+// Health: every provider adapter, its methods and circuit-breaker state.
+func (s *Service) Health() []ProviderHealth { return s.router.Health(s.gateways) }
 
 // HandleCallback processes an inbound provider notification.
 func (s *Service) HandleCallback(ctx context.Context, provider string, r *http.Request, body []byte) (string, error) {

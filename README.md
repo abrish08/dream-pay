@@ -26,22 +26,25 @@ No code changes and no service URLs: the bus finds whichever process handles a r
 Needs Go 1.24+ and PostgreSQL. Docker and `make` are optional.
 
 ```bash
-./scripts/run.sh env      # creates .env from .env.example (dev keys included)
+./scripts/run.sh env      # creates .env with freshly generated secrets, prints the first admin's password
 # edit .env: DATABASE_URL=postgres://<user>:<password>@localhost:5432/gateway?sslmode=disable
 ./scripts/run.sh db       # creates the "gateway" database (tables are created on start)
 ./scripts/run.sh          # starts on http://localhost:8080
 
-# in another terminal: login, onboarding, API key, payment, refund, security checks
-API=http://localhost:8080 ADMIN_EMAIL=admin@paygate.local ADMIN_PASSWORD=change-me-admin-password ./scripts/demo.sh
+./scripts/run.sh demo     # in another terminal: login, onboarding, API key, payment, refund, checks
 ```
+
+`.env.example` holds placeholders only (`CHANGE_ME`); the app will not start
+until they are replaced. `.env` is git-ignored: never commit it.
 
 With `make` installed: `make env`, `make db`, `make run`, `make demo`.
 
 Everything in Docker:
 
 ```bash
+./scripts/run.sh env                          # once: compose reads the secrets from .env
 docker compose --profile mono  up --build     # monolith
-docker compose --profile micro up --build     # 8 services + 8 databases + NATS + edge gateway
+docker compose --profile micro up --build     # 9 services + 9 databases + NATS + edge gateway
 ```
 
 Both listen on http://localhost:8080 and `scripts/demo.sh` runs unchanged against either.
@@ -129,13 +132,14 @@ whether its peer is in-process or in another service.
 
 | Module | Handles (requests) | Asks | Publishes | Subscribes |
 |---|---|---|---|---|
-| **merchant** | `merchants.GetMerchant` | – | `MerchantUpdated` | – |
-| **auth** | `auth.ExchangeAPIKey` | `GetMerchant` (only for a merchant it has not seen) | – | `MerchantUpdated` |
+| **merchant** | `merchants.GetMerchant`, `CreateMerchant` | – | `MerchantUpdated` | – |
+| **auth** | `auth.ExchangeAPIKey`, `RegisterPermissions` | `GetMerchant`, `CreateMerchant` (signup) | `AccessChanged` | `MerchantUpdated` |
 | **provider** | `providers.InitiateCheckout`, `VerifyTransaction`, `Refund` | – | `providers.TransactionUpdated` | – |
-| **payment** | `payments.GetPayment`, `ListPayments` | `GetMerchant`, `InitiateCheckout` | `PaymentSucceeded`, `PaymentFailed` | `TransactionUpdated`, `RefundSucceeded` |
+| **payment** | `payments.GetPayment`, `ListPayments` | `GetMerchant`, `InitiateCheckout`, `VerifyTransaction` (expiry) | `PaymentSucceeded`, `PaymentFailed`, `PaymentExpired` | `TransactionUpdated`, `RefundSucceeded` |
 | **refund** | – | `GetPayment`, `providers.Refund` | `RefundSucceeded`, `RefundFailed` | – |
-| **ledger** | – | – | – | `PaymentSucceeded`, `RefundSucceeded` |
-| **webhook** | – | – | – | payment.\*, refund.\* |
+| **ledger** | `ledger.ReserveFunds` | – | – | `PaymentSucceeded`, `RefundSucceeded`, `PayoutPaid`, `PayoutFailed` |
+| **payout** | – | `GetMerchant`, `ReserveFunds` | `PayoutPaid`, `PayoutFailed` | – |
+| **webhook** | – | – | – | payment.\*, refund.\*, payout.\* |
 | **reconciliation** | – | `ListPayments`, `VerifyTransaction` | – | – |
 
 Every service authenticates its own HTTP requests (see *Authentication and RBAC*).
@@ -190,6 +194,75 @@ service on its own database**, with two payment replicas behind a NATS queue gro
 | Platform staff | login → access token (JWT) | `/admin/*` | platform role |
 | Merchant team member | login → access token (JWT) | `/v1/*` (own merchant only) | merchant role |
 | Merchant server | API key `sk_live_…` / `sk_test_…` | `/v1/*` (own merchant only) | the key's scopes |
+
+### Signing in
+
+| Way | Endpoint | Notes |
+|---|---|---|
+| Sign up | `POST /auth/signup` → 6-digit code → `POST /auth/verify` | no token until the code is confirmed |
+| Email + password | `POST /auth/login` | argon2id; 5 failures lock 15 min; unverified → `403 verification_required` + new code |
+| Google / Apple | `POST /auth/oauth/google`, `/auth/oauth/apple` with the app's ID token | provider-verified email; signature, issuer, audience, expiry, nonce checked |
+| Authenticator step | `POST /auth/login/mfa` `{mfa_token, code}` | only when the user enabled an authenticator app |
+| Refresh | `POST /auth/refresh` | refresh token rotates; re-use of an old one signs the user out everywhere |
+| Forgot password | `POST /auth/password/forgot` → email → `POST /auth/password/reset` | always 202; single-use 256-bit token, 30 min; 3 emails/hour |
+| Change password | `POST /auth/password` `{current_password, new_password, totp_code}` | **requires an authenticator code** |
+
+Every completed sign-in returns an **access token** (JWT, 5 min, carries roles
+and permissions) and a **refresh token** (7 days, stored hashed, rotated).
+
+#### Account verification (6-digit code)
+
+* Self-signup and team members invited by a merchant must verify before
+  getting any token. The code goes **by email** (any SMTP provider) or, with
+  `verification_channel: "sms"` and a phone number, **by SMS through send.et**.
+  send.et is an SMS gateway; it does not send email.
+* Codes: random 6 digits, stored as HMAC(pepper, user, code), valid 15 min,
+  single use, 5 wrong tries kill the code, a new code replaces the old one,
+  at most 1 send per minute and 5 per hour. `POST /auth/verify/resend` always
+  answers 202 (no account enumeration).
+* **Admins bypass it**: platform staff, and accounts created by platform staff
+  (an administrator vouched for them), never need a code.
+* A verified email (code, Google/Apple, or completed password reset) is what
+  allows linking Google/Apple to an existing account.
+
+#### Authenticator app (Microsoft Authenticator, TOTP)
+
+1. `POST /auth/mfa/totp/setup` → `secret` + `otpauth_url` (show it as a QR code).
+2. Scan with Microsoft Authenticator (Google Authenticator, Authy... work too).
+3. `POST /auth/mfa/totp/confirm {code}` → enabled; **10 recovery codes** shown once.
+
+Then: changing the password needs `totp_code` from the app (a recovery code is
+not accepted for that); login asks for the app code as a second step
+(`mfa_required`), where a recovery code also works once. Disabling needs the
+password and a code. Secrets are encrypted with `DATA_ENCRYPTION_KEY`; a code
+is accepted only once (no replay); wrong codes count toward the account lockout;
+enabling, disabling and using recovery codes trigger an email notice.
+
+#### One account per email
+
+Signing up with a password for an email that already has an account (any
+method) is `409 email_taken`. Signing in with Google/Apple when an account
+already uses that (provider-verified) email **links** to it: never a second
+account. If that account's email was never verified, its password is removed
+and its sessions end when the verified owner links (prevents account
+pre-hijacking).
+
+#### Other protections
+
+* Security headers on every response: `nosniff`, no framing, no referrer,
+  strict Content-Security-Policy (`default-src 'none'` for the API), HSTS when
+  `HSTS=true`.
+* Per-IP rate limits on signup, login, verify, MFA and password endpoints; per
+  key/user limits elsewhere.
+* Every security event (signup, verification, password change/reset, MFA on/off,
+  role changes) goes to the audit log; sensitive ones also email the user.
+* Password change, password reset, role changes and disabling a user make the
+  user's existing access tokens stale everywhere within seconds.
+
+**Default admin.** On first start, `BOOTSTRAP_ADMIN_EMAIL` /
+`BOOTSTRAP_ADMIN_PASSWORD` create a `super_admin`: a locked role holding every
+platform permission, including permissions of modules added later. It is
+verified by definition. Turn on its authenticator right after the first login.
 
 ### Dynamic RBAC: user → many roles → many permissions
 
@@ -275,9 +348,21 @@ but never create them.
 
 ## API summary
 
+**Integrators: every endpoint is documented in the app**: `/swagger`
+(Swagger UI, try requests), `/docs` (reference) and `/openapi.yaml` (for SDK
+generators). `TestAPIDocsCoverEveryRoute` fails the build if a route is
+missing from the spec.
+
 | Method | Path | Who / permission | Service |
 |---|---|---|---|
+| POST | `/auth/signup` (merchant self-signup → pending, test mode at once) | none | auth |
 | POST | `/auth/login`, `/auth/refresh`, `/auth/logout` | none | auth |
+| GET | `/v1/merchant` (own account, status, fee) | any merchant caller | merchant |
+| GET, PATCH | `/admin/merchants?status=pending`, PATCH `/admin/merchants/{id}` `{fee_bps}` | staff, `merchants:read` / `merchants:manage` | merchant |
+| POST, GET | `/v1/payouts[/{id}]` (POST: logged-in user only) | `payouts:write` / `payouts:read` | payout |
+| GET, POST | `/admin/payouts?status=requested`, POST `/admin/payouts/{id}/paid` / `/failed` | staff, `payouts:manage` | payout |
+| GET | `/v1/refunds?payment_id=` | `payments:read` | refund |
+| POST | `/v1/webhook-endpoints/{id}/rotate-secret`, `/v1/webhook-deliveries/{id}/retry` | `webhooks:write` | webhook |
 | GET | `/auth/me`; POST `/auth/password` | any logged-in caller | auth |
 | GET | `/.well-known/jwks.json` | none | auth |
 | POST, GET, DELETE | `/v1/api-keys[/{id}]`, POST `/v1/api-keys/{id}/roll` | merchant user, `apikeys:manage` | auth |
@@ -369,6 +454,7 @@ Other modules still use SQL files and can move to models the same way.
 ```
 cmd/paygate/            the service binary (MODULES decides what runs inside)
 cmd/edge/               dev API gateway: routes HTTP paths to the owning service
+cmd/loadtest/           load generator (goroutines): throughput and latency
 internal/app/           composition root: bus + enabled modules (+ e2e test)
 internal/contracts/     THE shared language: requests, events, DTOs, error codes
   merchants/ auth/ providers/ payments/ refunds/ ledger/ webhooks/ reconciliation/
@@ -388,13 +474,86 @@ scripts/demo.sh         curl walkthrough (monolith or microservices)
 scripts/check-boundaries.sh
 ```
 
+## Performance and concurrency
+
+Measured with `go run ./cmd/loadtest` (goroutines as clients) on one laptop
+(i7-1165G7, 4 cores / 8 threads, 14 GB) running **the app, Postgres and the
+load generator together**, monolith mode, rate limit off. Zero errors in
+every run.
+
+| Scenario | Clients | Throughput | p50 | p99 |
+|---|---|---|---|---|
+| `GET /healthz` (HTTP only) | 50 | 55,000 req/s | 0.7 ms | 4 ms |
+| `GET /v1/payments/{id}` (API key auth + DB read) | 50 | 15,300 req/s | 2.6 ms | 12 ms |
+| `GET /v1/payments?limit=20` | 50 | 14,900 req/s | 2.8 ms | 12 ms |
+| `POST /v1/payments` (auth, merchant lookup, routing + provider, 3 writes) | 50 | 930 req/s | 49 ms | 135 ms |
+| `POST /v1/payments` | 200 | 1,420 req/s | 126 ms | 376 ms |
+| mixed 80% read / 20% create | 100 | 5,550 req/s | 12 ms | 79 ms |
+| mixed 80% read / 20% create | 1,000 | 5,900 req/s | 114 ms | 764 ms |
+
+Run it yourself (server started with `RATE_LIMIT_RPS=0`):
+`go run ./cmd/loadtest -url http://localhost:8080 -c 100 -d 20s -scenario mixed -admin-email <admin> -admin-password <password>`
+(the admin creates a throwaway merchant; or pass `-key sk_test_...`).
+
+Payment creation is bound by Postgres commits (disk flush per transaction).
+On real servers (separate DB host with fast NVMe, more cores) expect several
+times more; scale out by running more app replicas (stateless) and moving hot
+modules to their own database (`DB_URL_<MODULE>`).
+
+How concurrency is handled:
+
+* **Go's HTTP server runs every request on its own goroutine**; background
+  work (outbox relays, webhook delivery, expiry, refund retry, payout
+  reservation) runs in goroutines per module, stopped cleanly on shutdown.
+* **Database connections are pooled** per module (`DB_MAX_CONNS_PER_MODULE`).
+* **Money is protected by the database, not by luck**: unique
+  `(merchant, Idempotency-Key)` constraints (50 identical concurrent requests
+  → 1 payment), row locks on state changes, a per-payment advisory lock for
+  refunds (20 concurrent 10 % refunds → exactly 10 succeed), and a
+  per-merchant lock in the ledger for payouts (concurrent payouts never exceed
+  the balance). Workers claim jobs with `FOR UPDATE SKIP LOCKED`, so replicas
+  never process the same job twice.
+* `TestConcurrency` proves these with goroutines on every test run, and the
+  whole suite passes under Go's race detector (`go test -race ./...`).
+
+## Payment providers: hybrid model (direct + backup)
+
+Merchants ask for a **payment method**, never a provider:
+
+```
+POST /v1/payments {"payment_method": "telebirr", ...}     -> routed, checkout_url = provider page
+POST /v1/payments {...no payment_method...}               -> checkout_url = /pay/{id} (our hosted page,
+                                                             the customer picks a method)
+```
+
+The provider module routes each method through `PROVIDER_ROUTES`
+(`telebirr=telebirr,backup_x;card=ethswitch`): the first healthy provider
+is used; when one is down (timeouts, 5xx) the next is tried, and a provider
+that keeps failing is skipped for 30 s (circuit breaker). Declines are never
+retried elsewhere. `GET /v1/payment-methods` tells merchants what is
+available; `GET /admin/providers` shows staff each adapter and its health.
+
+This is the hybrid path: start a method on whatever connection is signed
+first, then move it to a direct integration by changing one line of
+`PROVIDER_ROUTES`. Merchants and their code never change.
+
+**Today only the sandbox adapter is installed**: test mode works for every
+method; live methods report `payment_method_unavailable` until a direct
+adapter is added. Each adapter is one file implementing `gateway.Gateway`
+(`internal/modules/provider/internal/gateway/gateway.go` lists the rules) and
+needs the provider's API specification and test credentials. What to request
+from each provider: [docs/PROVIDER_ONBOARDING.md](docs/PROVIDER_ONBOARDING.md).
+
 ## Not included yet
 
-* Email invitations / password reset, 2FA (TOTP), SSO for staff.
+* Direct provider adapters (telebirr, CBE Birr, M-Pesa, card switch, banks):
+  routing, failover and the hosted page are ready; each adapter needs the
+  provider's licensed API documents and credentials.
+* KYC document upload and review (signup + staff approval exist).
+* Automatic payouts through a bank transfer API (today finance sends the
+  transfer and marks the payout paid).
+* Customer receipts by email; WebAuthn / passkeys as a second factor.
+* Disputes / chargebacks, payment links, reports and CSV exports.
 * NATS per-service credentials (config only; see Security).
-* More provider adapters (telebirr, CBE Birr): implement `gateway.Gateway` in
-  `internal/modules/provider/internal/gateway/` and register it in `module.go`.
-  The Chapa adapter follows Chapa's public API; confirm endpoints and the
-  webhook signature header against their docs before going live.
-* NATS TLS/credentials config, per-key rate limiting, OpenTelemetry tracing.
-* Merchant payouts/settlement (a new module consuming ledger events).
+* NATS TLS/credentials config, OpenTelemetry tracing, a shared (Redis)
+  rate limiter for multi-replica deployments.

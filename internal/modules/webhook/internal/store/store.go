@@ -112,6 +112,33 @@ func (s *Store) SaveDelivery(q *gorm.DB, d *domain.Delivery) error {
 	return q.Table(deliveries).Where("id = ?", d.ID).Select("*").Updates(d).Error
 }
 
+var ErrDeliveryNotFound = apperror.NotFound("webhook_delivery_not_found", "webhook delivery not found")
+
+// RetryDelivery queues a delivery to be sent again now (failed or pending).
+func (s *Store) RetryDelivery(q *gorm.DB, merchantID, id string, now time.Time) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return ErrDeliveryNotFound
+	}
+	res := q.Table(deliveries).Where("id = ? AND merchant_id = ? AND status <> 'delivered'", id, merchantID).
+		Updates(map[string]any{"status": "pending", "next_attempt_at": now, "locked_until": nil})
+	if res.Error == nil && res.RowsAffected == 0 {
+		return apperror.NotFound("webhook_delivery_not_retryable", "no undelivered delivery with this id")
+	}
+	return res.Error
+}
+
+func (s *Store) SetEndpointSecret(q *gorm.DB, merchantID, id, encrypted string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return ErrEndpointNotFound
+	}
+	res := q.Model(&endpointRecord{}).Where("id = ? AND merchant_id = ? AND active", id, merchantID).
+		Update("secret_encrypted", encrypted)
+	if res.Error == nil && res.RowsAffected == 0 {
+		return ErrEndpointNotFound
+	}
+	return res.Error
+}
+
 func (s *Store) ListDeliveries(q *gorm.DB, merchantID string, limit int) ([]domain.Delivery, error) {
 	var out []domain.Delivery
 	err := q.Table(deliveries).Where("merchant_id = ?", merchantID).Order("created_at DESC").Limit(limit).Find(&out).Error

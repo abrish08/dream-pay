@@ -41,10 +41,13 @@ func New(d Deps) *Module {
 }
 
 func (m *Module) RegisterRoutes(r module.Routers) {
-	transport.NewHTTP(m.svc, m.Log).RegisterAdmin(r.Admin)
+	h := transport.NewHTTP(m.svc, m.Log)
+	h.RegisterAdmin(r.Admin)
+	h.RegisterPublic(r.Public)
 }
 
-// Handles: merchants.GetMerchant. Publishes: merchants.MerchantUpdated.
+// Handles: merchants.GetMerchant, merchants.CreateMerchant (self-signup).
+// Publishes: merchants.MerchantUpdated.
 func (m *Module) RegisterHandlers(b bus.Bus) {
 	transport.RegisterBus(b, m.svc)
 }

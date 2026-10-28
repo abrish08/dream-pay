@@ -7,3 +7,4 @@ CREATE DATABASE gw_refund;
 CREATE DATABASE gw_ledger;
 CREATE DATABASE gw_webhook;
 CREATE DATABASE gw_reconciliation;
+CREATE DATABASE gw_payout;

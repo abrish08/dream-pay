@@ -7,6 +7,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -22,15 +23,20 @@ import (
 	"paygate/internal/platform/authn"
 	"paygate/internal/platform/bus"
 	"paygate/internal/platform/events"
+	"paygate/internal/platform/mail"
 	"paygate/internal/platform/reqctx"
+	"paygate/internal/platform/secrets"
+	"paygate/internal/platform/sms"
 )
 
 var (
-	errLocked     = apperror.Unauthorized("account_locked", "too many failed logins; try again in a few minutes")
-	errForbidden  = apperror.Forbidden("permission_denied", "you are not allowed to do this")
-	errLastAdmin  = apperror.Unprocessable("last_admin", "this is the last active user with this role; add another first")
-	errSelf       = apperror.Unprocessable("cannot_disable_self", "you cannot disable your own account")
-	errTooManyKey = apperror.Unprocessable("too_many_api_keys", "revoke an unused API key first (limit reached)")
+	errLocked      = apperror.Unauthorized("account_locked", "too many failed logins; try again in a few minutes")
+	errForbidden   = apperror.Forbidden("permission_denied", "you are not allowed to do this")
+	errLastAdmin   = apperror.Unprocessable("last_admin", "this is the last active user with this role; add another first")
+	errSelf        = apperror.Unprocessable("cannot_disable_self", "you cannot disable your own account")
+	errTooManyKey  = apperror.Unprocessable("too_many_api_keys", "revoke an unused API key first (limit reached)")
+	errNotApproved = apperror.Forbidden("merchant_not_approved",
+		"your account is waiting for approval: test mode works now, live mode after approval")
 )
 
 type Config struct {
@@ -43,6 +49,14 @@ type Config struct {
 
 	BootstrapEmail    string // first super_admin, created once if none exists
 	BootstrapPassword string
+	BootstrapName     string
+
+	Identity     map[string]*authn.OIDC // "google", "apple": enabled when client ids are configured
+	Box          *secrets.Box           // encrypts authenticator secrets
+	SMS          sms.Sender             // verification codes by SMS (send.et); nil = email only
+	Mailer       mail.Sender
+	DashboardURL string        // base of links in emails (password reset page)
+	ResetTTL     time.Duration // password reset link lifetime
 }
 
 type Service struct {
@@ -64,6 +78,10 @@ func New(st *store.Store, b bus.Bus, pub events.Publisher, cfg Config, log *slog
 	if cfg.RefreshTTL == 0 {
 		cfg.RefreshTTL = 7 * 24 * time.Hour
 	}
+	if cfg.ResetTTL == 0 {
+		cfg.ResetTTL = 30 * time.Minute
+	}
+	cfg.DashboardURL = strings.TrimRight(cfg.DashboardURL, "/")
 	return &Service{store: st, bus: b, events: pub, cfg: cfg, log: log, now: func() time.Time { return time.Now().UTC() }}
 }
 
@@ -94,13 +112,20 @@ func userView(u *domain.User, roles []*domain.Role, perms []string) UserView {
 		Permissions: perms, Status: u.Status, LastLoginAt: u.LastLoginAt, CreatedAt: u.CreatedAt}
 }
 
+// Tokens is the answer to every sign-in. With an authenticator enabled the
+// first step returns only MFARequired + MFAToken; POST /auth/login/mfa with
+// the app's code returns the access and refresh tokens.
 type Tokens struct {
-	AccessToken      string    `json:"access_token"`
-	TokenType        string    `json:"token_type"`
-	ExpiresIn        int       `json:"expires_in"`
-	RefreshToken     string    `json:"refresh_token"`
-	RefreshExpiresAt time.Time `json:"refresh_expires_at"`
-	User             UserView  `json:"user"`
+	AccessToken      string     `json:"access_token,omitempty"`
+	TokenType        string     `json:"token_type,omitempty"`
+	ExpiresIn        int        `json:"expires_in,omitempty"`
+	RefreshToken     string     `json:"refresh_token,omitempty"`
+	RefreshExpiresAt *time.Time `json:"refresh_expires_at,omitempty"`
+	User             *UserView  `json:"user,omitempty"`
+
+	MFARequired  bool   `json:"mfa_required,omitempty"`
+	MFAToken     string `json:"mfa_token,omitempty"`
+	MFAExpiresIn int    `json:"mfa_expires_in,omitempty"`
 }
 
 // ---- Login / sessions ----
@@ -142,10 +167,18 @@ func (s *Service) Login(ctx context.Context, email, password string) (Tokens, er
 	if outcome != nil {
 		return Tokens{}, outcome
 	}
-	if err := s.merchantActive(ctx, u.MerchantID); err != nil {
+	if err := s.merchantAllowed(ctx, u.MerchantID, false); err != nil {
 		return Tokens{}, err
 	}
-	return s.startSession(ctx, u)
+	if !u.Verified() && !u.VerificationExempt() {
+		// Correct password but the account was never verified: send a code
+		// (respecting the send limits) and ask for it. No token until then.
+		if err := s.issueCode(ctx, u, ChannelEmail); err != nil {
+			s.log.Error("send verification code", "user_id", u.ID, "err", err)
+		}
+		return Tokens{}, errVerifyRequired
+	}
+	return s.complete(ctx, u)
 }
 
 func (s *Service) startSession(ctx context.Context, u *domain.User) (Tokens, error) {
@@ -170,8 +203,9 @@ func (s *Service) tokens(ctx context.Context, u *domain.User, refresh string, re
 	if err != nil {
 		return Tokens{}, err
 	}
+	view := userView(u, roles, p.Permissions)
 	return Tokens{AccessToken: access, TokenType: "Bearer", ExpiresIn: int(s.cfg.AccessTTL.Seconds()),
-		RefreshToken: refresh, RefreshExpiresAt: refreshExp, User: userView(u, roles, p.Permissions)}, nil
+		RefreshToken: refresh, RefreshExpiresAt: &refreshExp, User: &view}, nil
 }
 
 // Refresh rotates the refresh token. Presenting a token that was already
@@ -223,7 +257,7 @@ func (s *Service) Refresh(ctx context.Context, raw string) (Tokens, error) {
 	if outcome != nil {
 		return Tokens{}, outcome
 	}
-	if err := s.merchantActive(ctx, u.MerchantID); err != nil {
+	if err := s.merchantAllowed(ctx, u.MerchantID, false); err != nil {
 		return Tokens{}, err
 	}
 	return s.tokens(ctx, u, newRaw, newExp)
@@ -243,14 +277,30 @@ func (s *Service) Logout(ctx context.Context, raw string) error {
 }
 
 // ChangePassword also signs the user out everywhere else.
-func (s *Service) ChangePassword(ctx context.Context, p reqctx.Principal, current, next string) error {
-	return s.store.Tx(ctx, func(st *store.Store) error {
+// ChangePassword needs the current password AND a code from the user's
+// authenticator app (Microsoft Authenticator). Without an authenticator set
+// up, the change is refused: set one up first (/auth/mfa/totp/setup).
+func (s *Service) ChangePassword(ctx context.Context, p reqctx.Principal, current, next, totpCode string) error {
+	var wrong error
+	err := s.store.Tx(ctx, func(st *store.Store) error {
 		u, err := st.UserByID(ctx, p.Subject, true)
 		if err != nil {
 			return err
 		}
+		if !u.MFAEnabled() {
+			return errMFARequired
+		}
 		if !domain.CheckPassword(current, u.PasswordHash) {
-			return auth.ErrInvalidCredentials
+			u.LoginFailed(s.now())
+			wrong = auth.ErrInvalidCredentials
+			return st.SaveUser(ctx, u)
+		}
+		if err := s.checkSecondFactor(ctx, st, u, totpCode, false); err != nil {
+			if err == errBadMFACode || err == errLocked {
+				wrong = err
+				return nil // keep the failed-attempt count
+			}
+			return err
 		}
 		if u.PasswordHash, err = domain.HashPassword(next); err != nil {
 			return err
@@ -259,8 +309,21 @@ func (s *Service) ChangePassword(ctx context.Context, p reqctx.Principal, curren
 		if err := st.SaveUser(ctx, u); err != nil {
 			return err
 		}
-		return st.RevokeUserSessions(ctx, u.ID, s.now())
+		if err := st.RevokeUserSessions(ctx, u.ID, s.now()); err != nil {
+			return err
+		}
+		if err := st.Audit(ctx, store.Audit{ActorID: u.ID, MerchantID: u.MerchantID, Action: "user.password_changed",
+			TargetType: "user", TargetID: u.ID}, s.now()); err != nil {
+			return err
+		}
+		s.notify(u.Email, "Your paygate password was changed",
+			"Your password was changed and you were signed out everywhere else.\nIf this was not you, contact support at once.\n")
+		return s.events.Publish(ctx, st.DB(), auth.AccessChanged{UserIDs: []string{u.ID}, NotBefore: s.now()})
 	})
+	if err != nil {
+		return err
+	}
+	return wrong
 }
 
 func (s *Service) Me(ctx context.Context, p reqctx.Principal) (any, error) {
@@ -316,6 +379,12 @@ func (s *Service) CreateUser(ctx context.Context, actor reqctx.Principal, in Cre
 		MerchantID: in.MerchantID, CreatedBy: actor.Subject}, s.now())
 	if err != nil {
 		return UserView{}, err
+	}
+	if actor.IsPlatform() {
+		// Created by platform staff: an administrator vouched for this
+		// account, so it skips email verification. Users invited by a
+		// merchant verify their email on first login.
+		u.EmailVerifiedAt = &u.CreatedAt
 	}
 	var view UserView
 	err = s.store.Tx(ctx, func(st *store.Store) error {
@@ -430,8 +499,14 @@ func (s *Service) DisableUser(ctx context.Context, actor reqctx.Principal, id st
 
 // Bootstrap creates the first super_admin when nobody active holds the role
 // (first deploy).
+// Bootstrap seeds the first super_admin from the environment
+// (BOOTSTRAP_ADMIN_EMAIL / _PASSWORD / _NAME). It runs on every start but only
+// creates the admin while no active super_admin exists, so changing the
+// password later in the app is not undone by a restart. To reset a lost
+// admin, use "forgot password" (or disable the old admin and restart).
 func (s *Service) Bootstrap(ctx context.Context) error {
 	if s.cfg.BootstrapEmail == "" {
+		s.log.Info("no BOOTSTRAP_ADMIN_EMAIL: no admin seeded")
 		return nil
 	}
 	superAdmin := domain.SystemRoleID(auth.RoleSuperAdmin)
@@ -439,12 +514,17 @@ func (s *Service) Bootstrap(ctx context.Context) error {
 	if err != nil || n > 0 {
 		return err
 	}
-	u, err := domain.NewUser(domain.NewUserInput{Email: s.cfg.BootstrapEmail, Name: "Administrator",
+	name := s.cfg.BootstrapName
+	if name == "" {
+		name = "Administrator"
+	}
+	u, err := domain.NewUser(domain.NewUserInput{Email: s.cfg.BootstrapEmail, Name: name,
 		Password: s.cfg.BootstrapPassword}, s.now())
 	if err != nil {
-		return err
+		return fmt.Errorf("BOOTSTRAP_ADMIN_*: %w", err)
 	}
 	u.Role = auth.RoleSuperAdmin
+	u.EmailVerifiedAt = &u.CreatedAt // set by the operator in configuration
 	err = s.store.Tx(ctx, func(st *store.Store) error {
 		if err := st.CreateUser(ctx, u); err != nil {
 			return err
@@ -517,7 +597,7 @@ func (s *Service) CreateKey(ctx context.Context, actor reqctx.Principal, in Crea
 	if actor.Kind != reqctx.KindUser || actor.MerchantID == "" || !actor.Can(auth.APIKeysManage) {
 		return CreatedKey{}, errForbidden
 	}
-	if err := s.merchantActive(ctx, actor.MerchantID); err != nil {
+	if err := s.merchantAllowed(ctx, actor.MerchantID, in.Environment == "live"); err != nil {
 		return CreatedKey{}, err
 	}
 	c, err := s.store.Catalog(ctx)
@@ -638,7 +718,7 @@ func (s *Service) ExchangeAPIKey(ctx context.Context, raw string) (auth.AccessTo
 	if !k.Usable(now) {
 		return auth.AccessToken{}, auth.ErrInvalidKey
 	}
-	if err := s.merchantActive(ctx, k.MerchantID); err != nil {
+	if err := s.merchantAllowed(ctx, k.MerchantID, k.Environment == "live"); err != nil {
 		return auth.AccessToken{}, err
 	}
 	if k.PepperVersion != s.cfg.Pepper.Version {
@@ -694,8 +774,10 @@ func (s *Service) merchantStatus(ctx context.Context, id string) (string, error)
 	return m.Status, nil
 }
 
-// merchantActive is a no-op for platform staff (merchantID "").
-func (s *Service) merchantActive(ctx context.Context, merchantID string) error {
+// merchantAllowed: platform staff ("") always pass. A pending merchant
+// (signed up, not approved yet) can log in and use test mode; live mode
+// (live keys) needs an approved, active merchant.
+func (s *Service) merchantAllowed(ctx context.Context, merchantID string, live bool) error {
 	if merchantID == "" {
 		return nil
 	}
@@ -706,10 +788,87 @@ func (s *Service) merchantActive(ctx context.Context, merchantID string) error {
 	if err != nil {
 		return err
 	}
-	if status != merchants.StatusActive {
-		return auth.ErrMerchantInactive
+	switch {
+	case status == merchants.StatusActive:
+		return nil
+	case status == merchants.StatusPending && !live:
+		return nil
+	case status == merchants.StatusPending:
+		return errNotApproved
 	}
-	return nil
+	return auth.ErrMerchantInactive
+}
+
+// ---- Merchant self-signup ----
+
+type SignupInput struct {
+	BusinessName string `json:"business_name"`
+	Name         string `json:"name"` // the person signing up
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	Phone        string `json:"phone"`
+	Website      string `json:"website"`
+	Channel      string `json:"verification_channel"` // email (default) or sms
+}
+
+// Signup creates a pending merchant and its owner, and logs the owner in.
+// Test mode works at once; live keys wait until staff approve the merchant.
+// Signup creates a pending merchant and its owner, then sends a 6-digit code.
+// No token is issued until the code is confirmed (POST /auth/verify).
+func (s *Service) Signup(ctx context.Context, in SignupInput) (SignupResult, error) {
+	if strings.TrimSpace(in.Name) == "" {
+		in.Name = in.BusinessName
+	}
+	u, err := domain.NewUser(domain.NewUserInput{Email: in.Email, Name: in.Name, Password: in.Password}, s.now())
+	if err != nil {
+		return SignupResult{}, err
+	}
+	if u.Phone, err = domain.NormalizePhone(in.Phone); err != nil {
+		return SignupResult{}, err
+	}
+	if taken, err := s.store.EmailTaken(ctx, u.Email); err != nil || taken {
+		if err == nil {
+			err = store.ErrEmailTaken
+		}
+		return SignupResult{}, err
+	}
+	m, err := bus.Ask(ctx, s.bus, merchants.CreateMerchant{Name: in.BusinessName, Email: u.Email,
+		Phone: u.Phone, Website: in.Website})
+	if err != nil {
+		return SignupResult{}, err
+	}
+	// Known locally right away (the merchant.updated event may arrive later).
+	if err := s.store.UpsertMerchant(ctx, m.ID, m.Status, time.Unix(0, 0).UTC()); err != nil {
+		return SignupResult{}, err
+	}
+	u.MerchantID, u.Role = m.ID, auth.RoleOwner
+	err = s.store.Tx(ctx, func(st *store.Store) error {
+		if err := st.CreateUser(ctx, u); err != nil {
+			return err
+		}
+		if _, err := st.AssignRole(ctx, u.ID, domain.SystemRoleID(auth.RoleOwner), "", u.CreatedAt); err != nil {
+			return err
+		}
+		return st.Audit(ctx, store.Audit{ActorID: u.ID, MerchantID: m.ID, Action: "merchant.signed_up",
+			TargetType: "merchant", TargetID: m.ID, Details: map[string]any{"business_name": m.Name, "email": u.Email}}, u.CreatedAt)
+	})
+	if err != nil {
+		return SignupResult{}, err
+	}
+	s.log.Info("merchant signed up", "merchant_id", m.ID, "user_id", u.ID)
+	channel := ChannelEmail
+	if in.Channel == ChannelSMS && u.Phone != "" && s.cfg.SMS != nil {
+		channel = ChannelSMS
+	}
+	if err := s.issueCode(ctx, u, channel); err != nil {
+		return SignupResult{}, err
+	}
+	where := "your email"
+	if channel == ChannelSMS {
+		where = "your phone"
+	}
+	return SignupResult{VerificationRequired: true, Email: u.Email, Channel: channel,
+		Message: "We sent a 6-digit code to " + where + ". Enter it to activate your account (POST /auth/verify)."}, nil
 }
 
 func normEmail(e string) string { return strings.ToLower(strings.TrimSpace(e)) }
