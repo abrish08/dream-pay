@@ -349,6 +349,14 @@ cannot create more keys.
 Platform support can list and revoke a merchant's keys (e.g. a reported leak)
 but never create them.
 
+## Merchant integration guides
+
+How merchants connect their shop or app, with tested client code for
+**Node.js, PHP, Python, Java and Go**: [docs/integration](docs/integration/README.md)
+(code in [examples/integration](examples/integration)). Every library verifies
+webhooks against the same published signature vector, which the server's own
+test also checks.
+
 ## API summary
 
 **Integrators: every endpoint is documented in the app**: `/swagger`

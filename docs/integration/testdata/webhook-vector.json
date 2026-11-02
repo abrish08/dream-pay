@@ -1,0 +1,6 @@
+{
+  "secret": "whsec_test_5f3c1a9e7b2d4c6e8a0f1b3d5e7a9c1e",
+  "timestamp": 1762092000,
+  "body": "{\"id\":\"6a1f0c2e-3b4d-4e5f-8a9b-0c1d2e3f4a5b\",\"type\":\"payment.succeeded\",\"created\":1762092000,\"data\":{\"payment_id\":\"c542aff3-772e-475f-bd5c-575c007bed47\",\"merchant_id\":\"9fb6d90f-c984-4f74-be97-2b278b90f394\",\"environment\":\"test\",\"amount\":5000,\"fee\":75,\"currency\":\"USD\",\"provider\":\"mpgs_test\",\"provider_ref\":\"c542aff3-772e-475f-bd5c-575c007bed47\",\"reference\":\"ORDER-1001\",\"occurred_at\":\"2026-11-02T14:00:00Z\"}}",
+  "header": "t=1762092000,v1=9c86b7e7f7f8c187aacf3e8dbfff446e873deacba4b2f4812f499c687e6cef72"
+}
