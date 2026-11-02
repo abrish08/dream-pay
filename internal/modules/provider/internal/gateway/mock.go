@@ -26,7 +26,8 @@ func NewMock(state MockState, publicBaseURL string) *Mock {
 	return &Mock{state: state, baseURL: publicBaseURL}
 }
 
-func (m *Mock) Name() string { return "mock" }
+func (m *Mock) Name() string    { return "mock" }
+func (m *Mock) IsSandbox() bool { return true }
 
 // The sandbox simulates every method, so test mode works for all of them.
 func (m *Mock) Methods() []string    { return providers.Methods }

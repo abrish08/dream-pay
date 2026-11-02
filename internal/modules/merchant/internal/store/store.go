@@ -58,7 +58,7 @@ func (s *Store) GetForUpdate(ctx context.Context, id string) (*domain.Merchant, 
 func (s *Store) Save(ctx context.Context, m *domain.Merchant) error {
 	return s.db.WithContext(ctx).Table(table).Where("id = ?", m.ID).
 		Updates(map[string]any{"status": m.Status, "fee_bps": m.FeeBPS, "approved_at": m.ApprovedAt,
-			"updated_at": m.UpdatedAt}).Error
+			"kyc_status": m.KYCStatus, "updated_at": m.UpdatedAt}).Error
 }
 
 // List: newest first, optional status, cursor (created_at, id).

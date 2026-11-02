@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -40,6 +41,11 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("reading .env: %w", err)
 	} else if path != "" {
 		log.Info("settings loaded from file", "file", path)
+		// Relative paths in .env are relative to the .env file (the project
+		// root), not to wherever the command was started from.
+		if dir := os.Getenv("KYC_STORAGE_DIR"); dir != "" && !filepath.IsAbs(dir) {
+			_ = os.Setenv("KYC_STORAGE_DIR", filepath.Join(filepath.Dir(path), dir))
+		}
 	}
 	cfg, err := config.Load()
 	if err != nil {

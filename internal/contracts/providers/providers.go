@@ -70,6 +70,9 @@ type Transaction struct {
 	Status      string `json:"status"`
 	Amount      int64  `json:"amount"`
 	Currency    string `json:"currency"`
+	// FailureReason when failed, e.g. insufficient_funds, expired_card,
+	// declined, authentication_failed (3-D Secure).
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 type RefundResult struct {
@@ -141,13 +144,15 @@ const TopicTransactionUpdated = "provider.transaction.updated.v1"
 
 // TransactionUpdated: the provider reported a final status for a checkout.
 type TransactionUpdated struct {
-	Provider    string    `json:"provider"`
-	TxRef       string    `json:"tx_ref"`
-	ProviderRef string    `json:"provider_ref"`
-	Status      string    `json:"status"`
-	Amount      int64     `json:"amount"`
-	Currency    string    `json:"currency"`
-	OccurredAt  time.Time `json:"occurred_at"`
+	Provider    string `json:"provider"`
+	TxRef       string `json:"tx_ref"`
+	ProviderRef string `json:"provider_ref"`
+	Status      string `json:"status"`
+	Amount      int64  `json:"amount"`
+	Currency    string `json:"currency"`
+	// FailureReason: why the provider declined (see Transaction).
+	FailureReason string    `json:"failure_reason,omitempty"`
+	OccurredAt    time.Time `json:"occurred_at"`
 }
 
 func (TransactionUpdated) EventTopic() string { return TopicTransactionUpdated }

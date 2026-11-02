@@ -85,11 +85,21 @@ var SystemRoles = []SystemRole{
 	{auth.RoleOperations, auth.AudiencePlatform, "Merchant onboarding and operations", false},
 	{auth.RoleFinance, auth.AudiencePlatform, "Ledger, settlement and reconciliation", false},
 	{auth.RoleSupport, auth.AudiencePlatform, "Read-only merchant support", false},
+	{auth.RoleMerchant, auth.AudienceMerchant, "Default role of every merchant account; platform staff choose its permissions", false},
 	{auth.RoleOwner, auth.AudienceMerchant, "Full access to the merchant account", true},
 	{auth.RoleAdmin, auth.AudienceMerchant, "Manage the account, team and keys", false},
 	{auth.RoleDeveloper, auth.AudienceMerchant, "Integrate: payments, webhooks, API keys", false},
 	{auth.RoleAnalyst, auth.AudienceMerchant, "Payments, refunds and balance", false},
 	{auth.RoleViewer, auth.AudienceMerchant, "Read-only", false},
+}
+
+// DefaultMerchantPermissions seed the "merchant" role the first time it is
+// created (MERCHANT_DEFAULT_PERMISSIONS overrides them). After that, platform
+// staff edit the role; a restart never resets it.
+var DefaultMerchantPermissions = []string{
+	"payments:read", "payments:write", "refunds:write", "balance:read", "webhooks:write",
+	"apikeys:manage", "team:manage", "roles:read", "roles:manage",
+	"kyc:read", "kyc:write", "payouts:read", "payouts:write",
 }
 
 var roleNamespace = uuid.MustParse("6f0c6a52-0b7e-4c1e-9d1a-9a3b1c2d4e5f")

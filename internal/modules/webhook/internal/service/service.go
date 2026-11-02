@@ -18,6 +18,7 @@ import (
 	"paygate/internal/modules/webhook/internal/store"
 	"paygate/internal/platform/bus"
 	"paygate/internal/platform/events"
+	"paygate/internal/platform/netguard"
 	"paygate/internal/platform/secrets"
 )
 
@@ -59,12 +60,20 @@ type Service struct {
 }
 
 func New(db *gorm.DB, box *secrets.Box, allowInsecure bool, log *slog.Logger) *Service {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.Proxy = nil // a proxy would hide the real destination from the guard
+	if !allowInsecure {
+		// SSRF: refuse private, loopback, link-local and metadata addresses at
+		// connect time, after DNS (defeats names that resolve internally).
+		tr.DialContext = netguard.Dialer(5 * time.Second)
+	}
 	return &Service{
 		db: db, store: store.New(), box: box, allowInsecure: allowInsecure, log: log,
 		now: func() time.Time { return time.Now().UTC() },
 		hc: &http.Client{
-			Timeout: 10 * time.Second,
-			// Never follow redirects to other hosts (SSRF hygiene).
+			Timeout:   10 * time.Second,
+			Transport: tr,
+			// Never follow redirects (they could point anywhere).
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}

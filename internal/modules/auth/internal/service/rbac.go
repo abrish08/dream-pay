@@ -37,8 +37,20 @@ func (s *Service) Seed(ctx context.Context) error {
 		}
 		now := s.now()
 		for _, sr := range domain.SystemRoles {
-			if err := st.EnsureRole(ctx, sr.Role(now)); err != nil {
+			created, err := st.EnsureRole(ctx, sr.Role(now))
+			if err != nil {
 				return err
+			}
+			if created && sr.Name == auth.RoleMerchant {
+				// Seeded once, like the first admin: later edits by staff are kept.
+				perms := s.cfg.MerchantDefaultPermissions
+				if len(perms) == 0 {
+					perms = domain.DefaultMerchantPermissions
+				}
+				if err := st.AddRolePermissions(ctx, domain.SystemRoleID(auth.RoleMerchant), domain.Uniq(perms), now); err != nil {
+					return err
+				}
+				s.log.Info("seeded the default merchant role", "permissions", perms)
 			}
 		}
 		if _, err := s.register(ctx, st, "auth", auth.Permissions); err != nil {
@@ -447,8 +459,8 @@ func (s *Service) UpdateRole(ctx context.Context, a reqctx.Principal, id string,
 	})
 }
 
-// AddRolePermissions adds permissions to a role. Users holding the role get
-// them on their next token (refresh), at most AccessTTL later.
+// AddRolePermissions adds permissions to a role. Holders' current tokens
+// become stale, so they get the new permissions within seconds (refresh).
 func (s *Service) AddRolePermissions(ctx context.Context, a reqctx.Principal, id string, codes []string) (RoleView, error) {
 	codes = domain.Uniq(codes)
 	return s.changeRole(ctx, a, id, func(st *store.Store, r *domain.Role, now time.Time) (bool, error) {
@@ -471,7 +483,9 @@ func (s *Service) AddRolePermissions(ctx context.Context, a reqctx.Principal, id
 			return false, err
 		}
 		r.Permissions = domain.Uniq(append(r.Permissions, codes...))
-		return false, st.Audit(ctx, store.Audit{ActorID: a.Subject, MerchantID: r.MerchantID,
+		// Holders' tokens become stale too, so the new permissions apply
+		// within seconds (the client refreshes on token_stale).
+		return true, st.Audit(ctx, store.Audit{ActorID: a.Subject, MerchantID: r.MerchantID,
 			Action: "role.permissions_added", TargetType: "role", TargetID: r.ID,
 			Details: map[string]any{"permissions": codes}}, now)
 	})

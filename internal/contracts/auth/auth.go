@@ -73,7 +73,8 @@ const (
 	RoleSupport    = "support"
 
 	// Merchant templates, shared by every merchant.
-	RoleOwner     = "owner" // every merchant permission, now and future; locked
+	RoleMerchant  = "merchant" // default role of every new merchant account; staff choose its permissions
+	RoleOwner     = "owner"    // every merchant permission, now and future; locked
 	RoleAdmin     = "admin"
 	RoleDeveloper = "developer"
 	RoleAnalyst   = "analyst"

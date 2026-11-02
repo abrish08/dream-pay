@@ -35,9 +35,13 @@ const (
 // Expired -> Succeeded: the customer paid after expiry and the provider
 // confirmed it; the money was taken, so the payment must be honoured.
 var transitions = map[Status][]Status{
-	Pending:           {Processing, Failed, Expired},
-	Processing:        {Succeeded, Failed, Expired},
-	Expired:           {Succeeded, Failed},
+	Pending:    {Processing, Failed, Expired},
+	Processing: {Succeeded, Failed, Expired},
+	Expired:    {Succeeded, Failed},
+	// A card payment can be declined and then paid with another card in the
+	// same checkout: the provider's verified capture wins, or the customer's
+	// money would be taken for a "failed" payment.
+	Failed:            {Succeeded},
 	Succeeded:         {PartiallyRefunded, Refunded},
 	PartiallyRefunded: {PartiallyRefunded, Refunded},
 }
@@ -189,6 +193,11 @@ func (p *Payment) Fail(reason string, now time.Time) error {
 // An expired payment can still be captured if the customer paid late.
 func (p *Payment) Captured() bool {
 	return p.Status != Pending && p.Status != Processing && p.Status != Expired
+}
+
+// Settled: money was taken; nothing the provider reports can undo that.
+func (p *Payment) Settled() bool {
+	return p.Status == Succeeded || p.Status == PartiallyRefunded || p.Status == Refunded
 }
 
 // Expire closes a payment the customer did not complete in time.

@@ -6,9 +6,11 @@ import (
 
 	"gorm.io/gorm"
 
+	"paygate/internal/contracts/kyc"
 	"paygate/internal/contracts/merchants"
 	"paygate/internal/modules/merchant/internal/domain"
 	"paygate/internal/modules/merchant/internal/store"
+	"paygate/internal/platform/bus"
 	"paygate/internal/platform/events"
 )
 
@@ -101,11 +103,30 @@ func (s *Service) change(ctx context.Context, id string, fn func(*domain.Merchan
 	return toAPI(m), nil
 }
 
+// OnKYCStatusChanged consumes kyc.status_changed: records it and activates a
+// pending merchant whose verification was approved.
+func (s *Service) OnKYCStatusChanged(ctx context.Context, e bus.Envelope, evt kyc.StatusChanged) error {
+	return events.HandleOnce(ctx, s.db, "merchant.on_kyc_status_changed", e, func(tx *gorm.DB) error {
+		st := s.store.WithTx(tx)
+		m, err := st.GetForUpdate(ctx, evt.MerchantID)
+		if err != nil {
+			return err
+		}
+		if !m.OnKYC(evt.Status, s.now()) {
+			return nil
+		}
+		if err := st.Save(ctx, m); err != nil {
+			return err
+		}
+		return s.events.Publish(ctx, tx, updated(m))
+	})
+}
+
 func updated(m *domain.Merchant) merchants.MerchantUpdated {
-	return merchants.MerchantUpdated{ID: m.ID, Status: m.Status, FeeBPS: m.FeeBPS, UpdatedAt: m.UpdatedAt}
+	return merchants.MerchantUpdated{ID: m.ID, Status: m.Status, KYCStatus: m.KYCStatus, FeeBPS: m.FeeBPS, UpdatedAt: m.UpdatedAt}
 }
 
 func toAPI(m *domain.Merchant) merchants.Merchant {
 	return merchants.Merchant{ID: m.ID, Name: m.Name, Email: m.Email, Phone: m.Phone, Website: m.Website,
-		Status: m.Status, FeeBPS: m.FeeBPS, ApprovedAt: m.ApprovedAt, CreatedAt: m.CreatedAt}
+		Status: m.Status, FeeBPS: m.FeeBPS, KYCStatus: m.KYCStatus, ApprovedAt: m.ApprovedAt, CreatedAt: m.CreatedAt}
 }

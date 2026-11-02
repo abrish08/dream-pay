@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,7 +44,7 @@ func setup() (*Router, map[string]gateway.Gateway, *fake, *fake, *fake) {
 	r := NewRouter(map[string][]string{
 		providers.MethodTelebirr: {"telebirr_direct", "aggregator"},
 		providers.MethodCard:     {"aggregator"},
-	}, false)
+	}, nil, false)
 	return r, gws, direct, backup, mock
 }
 
@@ -117,5 +118,28 @@ func TestRetryable(t *testing.T) {
 	}
 	if Retryable(apperror.Invalid("invalid_phone", "bad phone number")) {
 		t.Fatal("a business error must not be retried at another provider")
+	}
+}
+
+type sandboxFake struct{ fake }
+
+func (*sandboxFake) IsSandbox() bool { return true }
+
+// TestSandboxSeparation: test payments may use a provider's TEST account,
+// never a live one; live payments never use a TEST account.
+func TestSandboxSeparation(t *testing.T) {
+	live := &fake{name: "mpgs", methods: []string{providers.MethodCard}}
+	test := &sandboxFake{fake{name: "mpgs_test", methods: []string{providers.MethodCard}}}
+	mock := &fake{name: "mock", methods: providers.Methods}
+	gws := map[string]gateway.Gateway{"mpgs": live, "mpgs_test": test, "mock": mock}
+	r := NewRouter(map[string][]string{providers.MethodCard: {"mpgs_test", "mpgs"}},
+		map[string][]string{providers.MethodCard: {"mpgs", "mpgs_test"}}, false)
+	got, _ := r.Candidates(gws, mock, providers.InitiateCheckout{Method: providers.MethodCard, Environment: "test", Currency: "ETB"})
+	if strings.Join(names(got), ",") != "mpgs_test,mock" {
+		t.Fatalf("test mode: %v", names(got))
+	}
+	got, _ = r.Candidates(gws, mock, providers.InitiateCheckout{Method: providers.MethodCard, Environment: "live", Currency: "ETB"})
+	if strings.Join(names(got), ",") != "mpgs" {
+		t.Fatalf("live mode: %v", names(got))
 	}
 }

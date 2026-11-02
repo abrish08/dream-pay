@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -26,5 +27,19 @@ func TestBoxRoundTrip(t *testing.T) {
 	other, _ := NewBox(bytes.Repeat([]byte{8}, 32))
 	if _, err := other.Decrypt(enc1); err == nil {
 		t.Fatal("wrong key must fail")
+	}
+}
+
+func TestSealBytes(t *testing.T) {
+	b, _ := NewBox(make([]byte, 32))
+	sealed, err := b.SealBytes([]byte("%PDF-1.7 secret"), []byte("doc-1"))
+	if err != nil || strings.Contains(string(sealed), "secret") {
+		t.Fatalf("seal: %v", err)
+	}
+	if got, err := b.OpenBytes(sealed, []byte("doc-1")); err != nil || string(got) != "%PDF-1.7 secret" {
+		t.Fatalf("open: %q %v", got, err)
+	}
+	if _, err := b.OpenBytes(sealed, []byte("doc-2")); err == nil {
+		t.Fatal("a file moved to another record must not decrypt")
 	}
 }

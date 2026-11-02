@@ -36,3 +36,13 @@ type Gateway interface {
 	// the tx_ref it refers to. The caller then calls Verify for the real status.
 	ParseCallback(r *http.Request, body []byte) (txRef string, err error)
 }
+
+// Sandboxed is implemented by adapters connected to a provider's TEST account
+// (e.g. an MPGS TEST merchant). Test-mode payments may use them through
+// PROVIDER_TEST_ROUTES; live payments never do.
+type Sandboxed interface{ IsSandbox() bool }
+
+func IsSandbox(g Gateway) bool {
+	s, ok := g.(Sandboxed)
+	return ok && s.IsSandbox()
+}

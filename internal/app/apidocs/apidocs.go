@@ -33,6 +33,10 @@ const swaggerPage = `<!doctype html>
 </body></html>`
 
 func Register(r chi.Router) {
+	// The root has no API: send people who open it in a browser to the docs.
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/docs", http.StatusFound)
+	})
 	r.Get("/swagger", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(swaggerPage))

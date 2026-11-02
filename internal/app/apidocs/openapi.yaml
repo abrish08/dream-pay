@@ -23,7 +23,9 @@ tags:
   - {name: Webhooks}
   - {name: API keys}
   - {name: Team & roles, description: "Merchant team members and custom roles (logged-in users)"}
+  - {name: KYC, description: "Business verification: required before live payments"}
   - {name: Admin - merchants & users}
+  - {name: Admin - KYC}
   - {name: Admin - roles}
   - {name: Admin - money}
   - {name: Hosted pages & providers, description: Called by customers' browsers and by payment providers}
@@ -548,7 +550,7 @@ paths:
     post:
       tags: [API keys]
       summary: Create an API key (apikeys:manage, logged-in users only)
-      description: The `secret` is shown once. Scopes can only be permissions you hold. Live keys need an approved merchant.
+      description: The `secret` is shown once. Scopes can only be permissions you hold. Test keys work at once; **live keys need an approved business verification (KYC)** (`403 kyc_required`).
       requestBody:
         required: true
         content:
@@ -669,6 +671,115 @@ paths:
       tags: [Team & roles]
       summary: Role, team and account changes (roles:read)
       responses: {"200": {$ref: "#/components/responses/AuditLog"}}
+
+  # ---------------- KYC (merchant) ----------------
+  /v1/kyc:
+    get:
+      tags: [KYC]
+      summary: "Your business verification: status, details, documents, what is missing (kyc:read)"
+      responses:
+        "200": {$ref: "#/components/responses/KYC"}
+  /v1/kyc/profile:
+    put:
+      tags: [KYC]
+      summary: Save business and owner details (kyc:write; while not submitted)
+      description: |
+        Can be saved incomplete; completeness is checked on submit. The owner's personal data is stored encrypted.
+        With `owner.id_type: fayda` the owner is verified through Fayda (POST /v1/kyc/fayda/start) and the owner
+        fields are filled in and locked from Fayda; with passport / residence_permit, fill in the owner and upload `owner_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"business_type": "plc", "legal_name": "Abebe Coffee PLC", "trade_name": "Abebe Coffee", "registration_number": "MT/AA/2/0012345/2016", "tin": "0012345678", "trade_license_number": "AA/14/123/2024", "trade_license_expiry": "2027-07-07", "vat_registered": true, "vat_number": "1234567", "applicant_role": "general_manager", "foreign_owned": false, "regulated_sector": false, "industry": "Coffee retail", "website": "https://abebecoffee.et", "description": "Specialty coffee shop and online store", "expected_monthly_volume_etb": 500000, "address": {"region": "Addis Ababa", "city": "Addis Ababa", "sub_city": "Bole", "woreda": "03", "house_number": "1234"}, "owner": {"id_type": "fayda"}}
+            schema: {$ref: "#/components/schemas/KYCProfile"}
+      responses:
+        "200": {$ref: "#/components/responses/KYC"}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+  /v1/kyc/documents:
+    post:
+      tags: [KYC]
+      summary: Upload a document (kyc:write) — PDF, JPEG or PNG, max 5 MB
+      description: |
+        `required_documents` in GET /v1/kyc lists what this business must provide (Ethiopian requirements):
+
+        | Document | Who |
+        |---|---|
+        | trade_license (valid, not expired) | all businesses (NGOs: registration_certificate) |
+        | commercial_registration | all businesses except NGOs |
+        | tin_certificate | everyone |
+        | memorandum_of_association, shareholders_list | PLC, share company, partnership |
+        | vat_certificate | VAT-registered |
+        | business_address_proof (lease or title deed) | everyone |
+        | bank_account_proof (letter or statement) | everyone |
+        | owner_id | owner not verified with Fayda |
+        | power_of_attorney | applicant is an authorized representative |
+        | investment_permit | foreign-owned |
+        | certificate_of_competence | regulated sectors |
+
+        The file type is checked from its content. Larger than 5 MB: `413 file_too_large`.
+        Files go to private object storage; only the object key is stored, links are created when read.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            example: {"type": "tin_certificate"}
+            schema:
+              type: object
+              required: [type, file]
+              properties:
+                type: {type: string, enum: [trade_license, commercial_registration, tin_certificate, vat_certificate, memorandum_of_association, shareholders_list, registration_certificate, business_address_proof, bank_account_proof, owner_id, power_of_attorney, investment_permit, certificate_of_competence, other]}
+                file: {type: string, format: binary, description: "PDF, JPEG or PNG; max 5 MB"}
+      responses:
+        "201":
+          description: Uploaded
+          content: {application/json: {schema: {$ref: "#/components/schemas/KYCDocument"}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+  /v1/kyc/documents/{id}:
+    get:
+      tags: [KYC]
+      summary: Get a short-lived download link for one of your documents (kyc:read)
+      description: The link is signed and expires in 5 minutes; ask again for a new one.
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {$ref: "#/components/responses/DocumentLink"}
+        "404": {$ref: "#/components/responses/Error"}
+    delete:
+      tags: [KYC]
+      summary: Delete a document while draft or rejected (kyc:write)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"204": {description: Deleted}, "409": {$ref: "#/components/responses/Error"}}
+  /v1/kyc/fayda/start:
+    post:
+      tags: [KYC]
+      summary: Verify the business owner with Fayda (national digital ID) (kyc:write)
+      description: |
+        Open `authorize_url` in the owner's browser. They sign in at Fayda (OTP to their Fayda phone) and consent;
+        Fayda returns to `/kyc/fayda/callback` and the browser lands on `<DASHBOARD_URL>/kyc?fayda=verified`
+        (or `?fayda=failed&reason=...`). Owner name, birth date, phone and photo then come from Fayda and are locked.
+        Single use, valid 10 minutes. `502 fayda_not_configured` when the gateway has no Fayda client.
+      responses:
+        "200":
+          description: Sign-in link
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: {authorize_url: {type: string, format: uri}, expires_at: {type: string, format: date-time}}
+              example: {"authorize_url": "https://esignet.ida.fayda.et/authorize?client_id=...&response_type=code&scope=openid+profile+email+phone&code_challenge=...&code_challenge_method=S256&state=...&nonce=...", "expires_at": "2026-11-02T10:10:00Z"}
+        "409": {$ref: "#/components/responses/Error"}
+        "502": {$ref: "#/components/responses/Error"}
+  /v1/kyc/submit:
+    post:
+      tags: [KYC]
+      summary: Send the verification for review (kyc:write)
+      description: "`422 kyc_incomplete` lists what is missing. After submitting, nothing can change until staff decide."
+      responses:
+        "200": {$ref: "#/components/responses/KYC"}
+        "422": {$ref: "#/components/responses/Error"}
 
   # ---------------- Admin: merchants & users ----------------
   /admin/merchants:
@@ -897,7 +1008,66 @@ paths:
       summary: Provider adapters, live routing and health (providers:read)
       responses: {"200": {description: Providers and routes}}
 
+  # ---------------- Admin: KYC review ----------------
+  /admin/kyc:
+    get:
+      tags: [Admin - KYC]
+      summary: Review queue, e.g. ?status=submitted, oldest first (kyc:review)
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [draft, submitted, approved, rejected]}}
+        - {$ref: "#/components/parameters/Limit"}
+        - {$ref: "#/components/parameters/StartingAfter"}
+      responses: {"200": {description: One page of applications}}
+  /admin/kyc/{merchantId}:
+    get:
+      tags: [Admin - KYC]
+      summary: Full application with documents and history (kyc:review)
+      parameters: [{$ref: "#/components/parameters/MerchantId"}]
+      responses: {"200": {$ref: "#/components/responses/KYC"}, "404": {$ref: "#/components/responses/Error"}}
+  /admin/kyc/{merchantId}/documents/{id}:
+    get:
+      tags: [Admin - KYC]
+      summary: Get a short-lived download link for a document (kyc:review; every view is recorded)
+      parameters: [{$ref: "#/components/parameters/MerchantId"}, {$ref: "#/components/parameters/Id"}]
+      responses: {"200": {$ref: "#/components/responses/DocumentLink"}, "404": {$ref: "#/components/responses/Error"}}
+  /admin/kyc/{merchantId}/approve:
+    post:
+      tags: [Admin - KYC]
+      summary: Approve; the merchant becomes active (live payments, live keys, payouts) (kyc:review)
+      parameters: [{$ref: "#/components/parameters/MerchantId"}]
+      requestBody:
+        content: {application/json: {example: {"note": "Documents verified against ERCA and the trade registry"}, schema: {type: object, properties: {note: {type: string}}}}}
+      responses: {"200": {$ref: "#/components/responses/KYC"}, "409": {$ref: "#/components/responses/Error"}}
+  /admin/kyc/{merchantId}/reject:
+    post:
+      tags: [Admin - KYC]
+      summary: Reject with a reason shown to the merchant; they fix and resubmit (kyc:review)
+      parameters: [{$ref: "#/components/parameters/MerchantId"}]
+      requestBody:
+        required: true
+        content: {application/json: {example: {"reason": "The TIN certificate is unreadable; upload a clear scan"}, schema: {type: object, required: [reason], properties: {reason: {type: string}}}}}
+      responses: {"200": {$ref: "#/components/responses/KYC"}, "400": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}}
+
   # ---------------- Hosted pages & provider callbacks ----------------
+  /kyc/fayda/callback:
+    get:
+      tags: [KYC]
+      summary: Fayda returns the owner here (browser redirect; not called by integrations)
+      security: []
+      parameters:
+        - {name: state, in: query, schema: {type: string}}
+        - {name: code, in: query, schema: {type: string}}
+        - {name: error, in: query, schema: {type: string}}
+      responses: {"303": {description: "Redirect to <DASHBOARD_URL>/kyc?fayda=verified | failed&reason=..."}}
+  /kyc/files/{token}:
+    get:
+      tags: [KYC]
+      summary: Download a document through a signed link (local storage only; with MinIO links point at MinIO)
+      security: []
+      parameters: [{name: token, in: path, required: true, schema: {type: string}}]
+      responses:
+        "200": {description: The file, content: {application/pdf: {}, image/jpeg: {}, image/png: {}}}
+        "404": {$ref: "#/components/responses/Error"}
   /pay/{id}:
     get:
       tags: [Hosted pages & providers]
@@ -930,6 +1100,28 @@ paths:
       security: []
       parameters: [{name: provider, in: path, required: true, schema: {type: string}}]
       responses: {"200": {description: Received}}
+  /providers/{provider}/pay/{txRef}:
+    get:
+      tags: [Hosted pages & providers]
+      summary: Card payment page (Mastercard Hosted Checkout); the checkout_url of a card payment
+      description: |
+        Loads Mastercard's checkout script for the session and sends the customer to the card form hosted by
+        Mastercard (card number, 3-D Secure). Card data never reaches this gateway.
+      security: []
+      parameters:
+        - {name: provider, in: path, required: true, schema: {type: string, example: mpgs}}
+        - {name: txRef, in: path, required: true, schema: {type: string}}
+        - {name: session, in: query, required: true, schema: {type: string}}
+      responses: {"200": {description: HTML page}, "404": {$ref: "#/components/responses/Error"}}
+  /providers/{provider}/return/{txRef}:
+    get:
+      tags: [Hosted pages & providers]
+      summary: The customer returns from the provider's page; status verified with the provider, then redirect to return_url
+      security: []
+      parameters:
+        - {name: provider, in: path, required: true, schema: {type: string, example: mpgs}}
+        - {name: txRef, in: path, required: true, schema: {type: string}}
+      responses: {"303": {description: "Redirect to the payment's return_url (or /pay/{id})"}, "404": {$ref: "#/components/responses/Error"}}
   /providers/mock/checkout/{txRef}:
     get:
       tags: [Hosted pages & providers]
@@ -947,6 +1139,12 @@ paths:
       responses: {"200": {description: Result page}, "303": {description: Back to the merchant's return_url}}
 
   # ---------------- System ----------------
+  /:
+    get:
+      tags: [System]
+      summary: Redirects to the API documentation (/docs)
+      security: []
+      responses: {"302": {description: Redirect to /docs}}
   /healthz:
     get:
       tags: [System]
@@ -986,6 +1184,7 @@ components:
       schema: {type: string, maxLength: 100}
       description: Unique per operation (e.g. order id + attempt). Reuse it when retrying.
     Id: {name: id, in: path, required: true, schema: {type: string, format: uuid}, example: "3f6c2a9e-8d41-4b7e-a0c5-91e2d7f4b8a1"}
+    MerchantId: {name: merchantId, in: path, required: true, schema: {type: string, format: uuid}, example: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"}
     RoleId: {name: roleId, in: path, required: true, schema: {type: string, format: uuid}, example: "9a1d3c5e-7b2f-4e6a-8c0d-2f4b6d8e0a1c"}
     Code: {name: code, in: path, required: true, schema: {type: string, example: "refunds:write"}}
     Limit: {name: limit, in: query, schema: {type: integer, default: 20, maximum: 100}}
@@ -1007,6 +1206,21 @@ components:
       required: true
       content: {application/json: {example: {"permissions": ["balance:read"]}, schema: {$ref: "#/components/schemas/PermissionsBody"}}}
   responses:
+    DocumentLink:
+      description: A download link built now from the stored object key; expires in 5 minutes
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              url: {type: string, format: uri}
+              expires_at: {type: string, format: date-time}
+              file_name: {type: string}
+              sha256: {type: string}
+          example: {"url": "https://files.paygate.example/kyc-documents/kyc/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/f1e2d3c4-b5a6-4978-8a9b-0c1d2e3f4a5b.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=300&X-Amz-Signature=...", "expires_at": "2026-11-02T10:05:00Z", "file_name": "tin.pdf", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+    KYC:
+      description: Verification
+      content: {application/json: {schema: {$ref: "#/components/schemas/KYCApplication"}}}
     Error:
       description: Error
       content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
@@ -1117,6 +1331,7 @@ components:
         phone: {type: string}
         website: {type: string}
         status: {type: string, enum: [pending, active, suspended]}
+        kyc_status: {type: string, enum: [not_started, draft, submitted, approved, rejected, waived]}
         fee_bps: {type: integer, description: "Platform fee in basis points (150 = 1.5%)"}
         approved_at: {type: string, format: date-time}
         created_at: {type: string, format: date-time}
@@ -1253,7 +1468,7 @@ components:
         password: {type: string, minLength: 12}
         roles: {type: array, items: {type: string}, description: Role ids or names}
         role: {type: string, description: Shorthand for one role}
-        merchant_id: {type: string, description: "Staff only: create a user of this merchant (pre-verified); omit for a staff user"}
+        merchant_id: {type: string, description: "Staff only: create a user of this merchant (pre-verified; default role \"merchant\" when no role is given); omit for a staff user"}
     AssignRoleBody:
       type: object
       required: [role]
@@ -1277,3 +1492,76 @@ components:
       required: [permissions]
       properties:
         permissions: {type: array, items: {type: string}}
+    KYCProfile:
+      type: object
+      properties:
+        business_type: {type: string, enum: [sole_proprietor, plc, share_company, partnership, ngo]}
+        legal_name: {type: string}
+        trade_name: {type: string}
+        registration_number: {type: string}
+        tin: {type: string, description: 10-digit Taxpayer Identification Number}
+        trade_license_number: {type: string}
+        trade_license_expiry: {type: string, format: date, description: Must not be expired when submitting}
+        vat_registered: {type: boolean}
+        vat_number: {type: string}
+        applicant_role: {type: string, enum: [owner, general_manager, authorized_representative]}
+        foreign_owned: {type: boolean, description: Needs an investment permit}
+        regulated_sector: {type: boolean, description: "Needs a certificate of competence (e.g. health, finance)"}
+        industry: {type: string}
+        website: {type: string}
+        description: {type: string}
+        expected_monthly_volume_etb: {type: integer}
+        address:
+          type: object
+          properties: {region: {type: string}, city: {type: string}, sub_city: {type: string}, woreda: {type: string}, house_number: {type: string}}
+        owner:
+          type: object
+          description: Owner / legal representative (stored encrypted). Filled in and locked by Fayda verification.
+          properties:
+            full_name: {type: string}
+            id_type: {type: string, enum: [fayda, passport, residence_permit]}
+            id_number: {type: string}
+            date_of_birth: {type: string, format: date}
+            nationality: {type: string}
+            phone: {type: string}
+    KYCDocument:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        type: {type: string}
+        file_name: {type: string}
+        content_type: {type: string}
+        size: {type: integer}
+        sha256: {type: string}
+        uploaded_at: {type: string, format: date-time}
+        url: {type: string, format: uri, description: Download link created on this read (expires in 5 minutes)}
+        url_expires_at: {type: string, format: date-time}
+    KYCApplication:
+      type: object
+      example: {"merchant_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d", "status": "draft", "profile": {"business_type": "plc", "legal_name": "Abebe Coffee PLC", "trade_name": "Abebe Coffee", "registration_number": "MT/AA/2/0012345/2016", "tin": "0012345678", "trade_license_number": "AA/14/123/2024", "trade_license_expiry": "2027-07-07", "vat_registered": true, "vat_number": "1234567", "applicant_role": "general_manager", "foreign_owned": false, "regulated_sector": false, "industry": "Coffee retail", "website": "https://abebecoffee.et", "description": "Specialty coffee shop and online store", "expected_monthly_volume_etb": 500000, "address": {"region": "Addis Ababa", "city": "Addis Ababa", "sub_city": "Bole", "woreda": "03", "house_number": "1234"}, "owner": {"full_name": "Abebe Kebede", "id_type": "fayda", "id_number": "1234-5678-9012-3456", "date_of_birth": "1985-04-12", "nationality": "ET", "phone": "+251911234567"}}, "documents": [{"id": "f1e2d3c4-b5a6-4978-8a9b-0c1d2e3f4a5b", "type": "tin_certificate", "file_name": "tin.pdf", "content_type": "application/pdf", "size": 182344, "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "uploaded_at": "2026-10-29T08:00:00Z", "url": "https://files.paygate.example/kyc-documents/kyc/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/f1e2d3c4-b5a6-4978-8a9b-0c1d2e3f4a5b.pdf?X-Amz-Expires=300&X-Amz-Signature=...", "url_expires_at": "2026-10-29T08:05:00Z"}], "required_documents": ["trade_license", "commercial_registration", "tin_certificate", "memorandum_of_association", "shareholders_list", "vat_certificate", "business_address_proof", "bank_account_proof"], "missing": ["document: trade_license", "document: commercial_registration"], "owner_identity": {"method": "fayda", "verified": true, "verified_at": "2026-10-29T07:55:00Z", "name": "Abebe Kebede Alemu", "birthdate": "1985-04-12", "nationality": "ETH", "individual_id": "••••••••3456", "fayda_available": true}}
+      properties:
+        merchant_id: {type: string}
+        status: {type: string, enum: [not_started, draft, submitted, approved, rejected, waived]}
+        profile: {$ref: "#/components/schemas/KYCProfile"}
+        documents: {type: array, items: {$ref: "#/components/schemas/KYCDocument"}}
+        required_documents: {type: array, items: {type: string}}
+        missing: {type: array, items: {type: string}}
+        owner_identity:
+          type: object
+          properties:
+            method: {type: string, enum: [fayda, document]}
+            verified: {type: boolean}
+            verified_at: {type: string, format: date-time}
+            name: {type: string}
+            birthdate: {type: string}
+            gender: {type: string}
+            phone_number: {type: string}
+            nationality: {type: string}
+            address: {type: string}
+            individual_id: {type: string, description: Masked}
+            photo_url: {type: string, description: Staff only; short-lived link}
+            fayda_available: {type: boolean}
+        submitted_at: {type: string, format: date-time}
+        reviewed_at: {type: string, format: date-time}
+        rejection_reason: {type: string}
+        history: {type: array, items: {type: object}, description: Staff only}

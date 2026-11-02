@@ -96,6 +96,7 @@ func (keyRec) TableName() string { return "api_keys" }
 type merchantRec struct {
 	ID        string    `gorm:"type:uuid;primaryKey"`
 	Status    string    `gorm:"type:text;not null"`
+	KYCStatus string    `gorm:"type:text;not null;default:''"`
 	UpdatedAt time.Time `gorm:"type:timestamptz;not null;autoUpdateTime:false"`
 }
 

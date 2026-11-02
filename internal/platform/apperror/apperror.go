@@ -22,6 +22,7 @@ const (
 	KindUnprocessable   Kind = "unprocessable"
 	KindUnavailable     Kind = "unavailable"
 	KindTooManyRequests Kind = "too_many_requests"
+	KindTooLarge        Kind = "too_large"
 	KindInternal        Kind = "internal"
 )
 
@@ -56,6 +57,7 @@ func NotFound(code, msg string) *Error      { return New(KindNotFound, code, msg
 func Conflict(code, msg string) *Error      { return New(KindConflict, code, msg) }
 func Unprocessable(code, msg string) *Error { return New(KindUnprocessable, code, msg) }
 func Unavailable(code, msg string) *Error   { return New(KindUnavailable, code, msg) }
+func TooLarge(code, msg string) *Error      { return New(KindTooLarge, code, msg) }
 
 var internalError = New(KindInternal, "internal_error", "an internal error occurred")
 
@@ -87,6 +89,8 @@ func Status(kind Kind) int {
 		return http.StatusBadGateway
 	case KindTooManyRequests:
 		return http.StatusTooManyRequests
+	case KindTooLarge:
+		return http.StatusRequestEntityTooLarge
 	default:
 		return http.StatusInternalServerError
 	}

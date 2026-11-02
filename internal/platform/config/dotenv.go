@@ -43,7 +43,8 @@ func LoadDotEnv() (string, error) {
 		key, val, ok := strings.Cut(line, "=")
 		key = strings.TrimSpace(key)
 		if !ok || key == "" || strings.ContainsAny(key, " \t") {
-			return "", fmt.Errorf("%s:%d: expected KEY=value", path, n)
+			// The line itself is not shown: it may be part of a secret.
+			return "", fmt.Errorf("%s:%d: expected KEY=value (a stray character, a missing '=', or a value split over two lines?)", path, n)
 		}
 		val = strings.TrimSpace(val)
 		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {

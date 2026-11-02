@@ -84,3 +84,22 @@ func RandomToken(n int) (string, error) {
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
+
+// SealBytes encrypts binary data (e.g. an uploaded document). aad binds the
+// ciphertext to its owner (e.g. the document id): a file copied onto another
+// record does not decrypt.
+func (b *Box) SealBytes(plain, aad []byte) ([]byte, error) {
+	nonce := make([]byte, b.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return b.aead.Seal(nonce, nonce, plain, aad), nil
+}
+
+func (b *Box) OpenBytes(sealed, aad []byte) ([]byte, error) {
+	ns := b.aead.NonceSize()
+	if len(sealed) < ns {
+		return nil, errors.New("ciphertext too short")
+	}
+	return b.aead.Open(nil, sealed[:ns], sealed[ns:], aad)
+}

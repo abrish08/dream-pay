@@ -37,6 +37,8 @@ case "${1:-run}" in
     set_var AUTH_PUBLIC_KEYS "$(sed -n 's/^AUTH_PUBLIC_KEYS=//p' <<<"$keys")"
     set_var API_KEY_PEPPER "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     set_var DATA_ENCRYPTION_KEY "$(rand_b64 32)"
+    set_var MINIO_ROOT_PASSWORD "$(rand_b64 24 | tr -d '+/=')"
+    set_var MINIO_KMS_SECRET_KEY "paygate-kyc:$(rand_b64 32)"
     admin_pw=$(rand_b64 18 | tr '+/' '-_')
     set_var BOOTSTRAP_ADMIN_PASSWORD "$admin_pw"
     echo "created .env with freshly generated secrets (file mode 600)"

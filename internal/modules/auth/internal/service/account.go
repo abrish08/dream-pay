@@ -161,15 +161,15 @@ func (s *Service) externalSignup(ctx context.Context, id authn.Identity, in Exte
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.UpsertMerchant(ctx, m.ID, m.Status, time.Unix(0, 0).UTC()); err != nil {
+	if err := s.store.UpsertMerchant(ctx, m.ID, m.Status, m.KYCStatus, time.Unix(0, 0).UTC()); err != nil {
 		return nil, err
 	}
-	u.MerchantID, u.Role = m.ID, auth.RoleOwner
+	u.MerchantID, u.Role = m.ID, auth.RoleMerchant // default role; staff choose its permissions
 	err = s.store.Tx(ctx, func(st *store.Store) error {
 		if err := st.CreateUser(ctx, u); err != nil {
 			return err
 		}
-		if _, err := st.AssignRole(ctx, u.ID, domain.SystemRoleID(auth.RoleOwner), "", u.CreatedAt); err != nil {
+		if _, err := st.AssignRole(ctx, u.ID, domain.SystemRoleID(auth.RoleMerchant), "", u.CreatedAt); err != nil {
 			return err
 		}
 		if err := st.LinkIdentity(ctx, id.Provider, id.Subject, u.ID, id.Email, u.CreatedAt); err != nil {

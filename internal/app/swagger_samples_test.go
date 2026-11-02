@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"paygate/internal/modules/kyc/faydatest"
+	"paygate/internal/platform/config"
 )
 
 // TestEveryEndpointWithSwaggerSamples calls EVERY operation in openapi.yaml,
@@ -42,7 +46,12 @@ func TestEveryEndpointWithSwaggerSamples(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c, _, stop := startApp(t, nil)
+	idp := faydatest.New("paygate-test-client") // so /v1/kyc/fayda/start works like in production
+	defer idp.Close()
+	c, _, stop := startApp(t, func(cfg *config.Config) {
+		cfg.FaydaIssuer, cfg.FaydaClientID, cfg.FaydaPrivateKey = idp.URL, idp.ClientID, idp.PrivateKeyJWK()
+		cfg.FaydaRedirectURI = cfg.PublicBaseURL + "/kyc/fayda/callback"
+	})
 	defer stop()
 	fx := newFixtures(c)
 
@@ -121,14 +130,14 @@ type body struct {
 
 // fixtures: real records the path parameters and samples point at.
 type fixtures struct {
-	c                                         *client
-	owner, key, refresh                       string
-	merchant, payment, refund, hosted, mockTx string
-	webhook, delivery, payout, run            string
-	role, roleDel, member, memberDel          string
-	staff, staffDel, staffRole, staffRoleDel  string
-	analystRole, supportRole                  string
-	keyRoll, keyDel, keyAdminDel              string
+	c                                               *client
+	owner, key, refresh                             string
+	merchant, payment, refund, hosted, mockTx       string
+	webhook, delivery, payout, run                  string
+	role, roleDel, member, memberDel                string
+	staff, staffDel, staffRole, staffRoleDel        string
+	analystRole, supportRole                        string
+	keyRoll, keyDel, keyAdminDel, kycDoc, kycDocDel string
 }
 
 func newFixtures(c *client) *fixtures {
@@ -164,6 +173,9 @@ func newFixtures(c *client) *fixtures {
 	f.payout = c.do("POST", "/v1/payouts", f.owner, "fixture-payout", map[string]any{"amount": 100000, "currency": "ETB",
 		"environment": "test", "bank_account": map[string]string{"bank_name": "Awash Bank", "account_number": "01320123456700",
 			"account_name": "Fixture PLC"}}, 201)["id"].(string)
+	c.do("PUT", "/v1/kyc/profile", f.owner, "", kycProfile, 200)
+	f.kycDoc = c.upload(f.owner, "trade_license", "license.pdf", samplePDF).body["id"].(string)
+	f.kycDocDel = c.upload(f.owner, "other", "extra.pdf", samplePDF).body["id"].(string)
 	f.run = c.do("POST", "/admin/reconciliation/runs", c.admin, "", map[string]any{"from": time.Now().Add(-24 * time.Hour).UTC(), "to": time.Now().Add(24 * time.Hour).UTC()}, 202)["id"].(string)
 
 	f.role = c.do("POST", "/v1/roles", f.owner, "", map[string]any{"name": "Fixture Role", "permissions": []string{"payments:read", "refunds:write"}}, 201)["id"].(string)
@@ -202,6 +214,8 @@ func (f *fixtures) fill(method, path string) string {
 			return "/v1/roles/" + f.roleDel
 		case "/admin/roles/{id}":
 			return "/admin/roles/" + f.staffRoleDel
+		case "/v1/kyc/documents/{id}":
+			return "/v1/kyc/documents/" + f.kycDocDel
 		}
 	}
 	id := map[string]string{
@@ -219,6 +233,7 @@ func (f *fixtures) fill(method, path string) string {
 		"/admin/roles/{id}/permissions/{code}": f.staffRole,
 		"/admin/payouts/{id}":                  f.payout, "/admin/payouts/{id}/paid": f.payout, "/admin/payouts/{id}/failed": f.payout,
 		"/admin/reconciliation/runs/{id}": f.run, "/pay/{id}": f.hosted,
+		"/admin/kyc/{merchantId}/documents/{id}": f.kycDoc, "/v1/kyc/documents/{id}": f.kycDoc,
 	}
 	out := path
 	if v, ok := id[path]; ok {
@@ -226,7 +241,7 @@ func (f *fixtures) fill(method, path string) string {
 	}
 	r := strings.NewReplacer("{roleId}", map[bool]string{true: f.supportRole, false: f.analystRole}[strings.HasPrefix(path, "/admin")],
 		"{keyId}", f.keyAdminDel, "{code}", map[bool]string{true: "ledger:read", false: "refunds:write"}[strings.HasPrefix(path, "/admin")],
-		"{txRef}", f.mockTx, "{provider}", "google")
+		"{txRef}", f.mockTx, "{provider}", "google", "{merchantId}", f.merchant)
 	out = r.Replace(out)
 	if path == "/providers/{provider}/callback" {
 		out = "/providers/mock/callback"
@@ -243,7 +258,7 @@ func (f *fixtures) callerFor(method, path string, open bool) string {
 		return f.c.admin
 	case strings.HasPrefix(path, "/auth"), strings.HasPrefix(path, "/v1/api-keys"), strings.HasPrefix(path, "/v1/team"),
 		strings.HasPrefix(path, "/v1/roles"), path == "/v1/permissions", path == "/v1/audit-log",
-		strings.HasPrefix(path, "/v1/payouts"), path == "/v1/merchant":
+		strings.HasPrefix(path, "/v1/payouts"), path == "/v1/merchant", strings.HasPrefix(path, "/v1/kyc"):
 		return f.owner
 	}
 	return f.key
@@ -281,6 +296,18 @@ func (f *fixtures) send(method, path, token string, b body) sent {
 			if _, has := m["refresh_token"]; has {
 				m["refresh_token"] = f.refresh
 			}
+		}
+		if media == "multipart/form-data" { // fields from the sample + a small PDF as the file
+			var buf bytes.Buffer
+			w := multipart.NewWriter(&buf)
+			for k, v := range ex.(map[string]any) {
+				_ = w.WriteField(k, fmt.Sprint(v))
+			}
+			part, _ := w.CreateFormFile("file", "sample.pdf")
+			_, _ = part.Write(samplePDF)
+			_ = w.Close()
+			rdr, ctype = &buf, w.FormDataContentType()
+			continue
 		}
 		if media == "application/x-www-form-urlencoded" {
 			form := url.Values{}

@@ -18,8 +18,9 @@ import (
 //	         customers are sent to the next provider instead of waiting on a
 //	         dead one; it is tried again after the cool-down.
 type Router struct {
-	routes    map[string][]string
-	allowMock bool // live payments may use the sandbox (development only)
+	routes     map[string][]string
+	testRoutes map[string][]string // test mode: providers' TEST accounts, then the sandbox
+	allowMock  bool                // live payments may use the sandbox (development only)
 
 	mu       sync.Mutex
 	breakers map[string]*breaker
@@ -37,8 +38,8 @@ type breaker struct {
 	lastError string
 }
 
-func NewRouter(routes map[string][]string, allowMock bool) *Router {
-	return &Router{routes: routes, allowMock: allowMock, breakers: map[string]*breaker{}, now: time.Now}
+func NewRouter(routes, testRoutes map[string][]string, allowMock bool) *Router {
+	return &Router{routes: routes, testRoutes: testRoutes, allowMock: allowMock, breakers: map[string]*breaker{}, now: time.Now}
 }
 
 // Candidates returns, in order, the providers to try for a checkout.
@@ -56,18 +57,26 @@ func (r *Router) Candidates(gws map[string]gateway.Gateway, mock gateway.Gateway
 	if !providers.ValidMethod(method) {
 		return nil, apperror.Invalid("invalid_payment_method", "unknown payment method "+method)
 	}
-	if req.Environment == "test" {
-		return []gateway.Gateway{mock}, nil // test money never reaches a real provider
+	test := req.Environment == "test"
+	var names []string
+	if test {
+		// Test money never reaches a live account: only TEST accounts
+		// (PROVIDER_TEST_ROUTES), then the built-in sandbox.
+		names = append(slices.Clone(r.testRoutes[method]), mock.Name())
+	} else {
+		names = r.routes[method]
+		if r.allowMock {
+			names = append(slices.Clone(names), mock.Name())
+		}
 	}
 	var out []gateway.Gateway
-	names := r.routes[method]
-	if r.allowMock {
-		names = append(slices.Clone(names), mock.Name())
-	}
 	for _, name := range names {
 		g, ok := gws[name]
 		if !ok || !slices.Contains(g.Methods(), method) || !slices.Contains(g.Currencies(), req.Currency) {
 			continue
+		}
+		if sandbox := g == mock || gateway.IsSandbox(g); test != sandbox && !(g == mock && r.allowMock) {
+			continue // live account in test mode, or test account in live mode
 		}
 		if req.Provider != "" && name != req.Provider {
 			continue

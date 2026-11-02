@@ -13,6 +13,7 @@ import (
 	"paygate/internal/modules/provider/internal/gateway"
 	"paygate/internal/modules/provider/internal/store"
 	"paygate/internal/platform/events"
+	"paygate/internal/platform/money"
 )
 
 type Service struct {
@@ -190,7 +191,61 @@ func (s *Service) sync(ctx context.Context, g gateway.Gateway, txRef string) err
 		}
 		return s.events.Publish(ctx, tx, providers.TransactionUpdated{
 			Provider: g.Name(), TxRef: txRef, ProviderRef: remote.ProviderRef, Status: remote.Status,
-			Amount: remote.Amount, Currency: remote.Currency, OccurredAt: s.now(),
+			Amount: remote.Amount, Currency: remote.Currency, FailureReason: remote.FailureReason, OccurredAt: s.now(),
 		})
 	})
+}
+
+// HostedCard is implemented by card adapters whose payment page is opened by
+// a script from the provider (e.g. Mastercard Hosted Checkout).
+type HostedCard interface {
+	ScriptURL() string
+	Origin() string
+}
+
+type CardPage struct {
+	ScriptURL, Origin, TxRef, Amount, Currency, CancelURL string
+}
+
+// HostedCardPage returns what our page needs to open the provider's card
+// form, only for a pending checkout of that provider.
+func (s *Service) HostedCardPage(ctx context.Context, provider, txRef string) (CardPage, error) {
+	g, err := s.gateway(provider)
+	if err != nil {
+		return CardPage{}, err
+	}
+	hc, ok := g.(HostedCard)
+	if !ok {
+		return CardPage{}, providers.ErrTransactionNotFound
+	}
+	t, err := s.store.GetTransaction(s.store.DB(ctx), txRef, false)
+	if err != nil {
+		return CardPage{}, err
+	}
+	if t.Provider != provider || t.Status != providers.StatusPending {
+		return CardPage{}, providers.ErrTransactionNotFound
+	}
+	return CardPage{ScriptURL: hc.ScriptURL(), Origin: hc.Origin(), TxRef: t.TxRef,
+		Amount: money.FormatMajor(t.Amount), Currency: t.Currency,
+		CancelURL: s.callbackBase + "/providers/" + provider + "/return/" + t.TxRef + "?cancelled=1"}, nil
+}
+
+// Return handles the customer coming back from the provider's page: the
+// result is read from the provider (never from the URL) before redirecting.
+func (s *Service) Return(ctx context.Context, provider, txRef string) (*store.Transaction, error) {
+	t, err := s.store.GetTransaction(s.store.DB(ctx), txRef, false)
+	if err != nil {
+		return nil, err
+	}
+	if t.Provider != provider {
+		return nil, providers.ErrTransactionNotFound
+	}
+	g, err := s.gateway(provider)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.sync(ctx, g, txRef); err != nil {
+		s.log.Warn("verify on return failed; the webhook or expiry check will settle it", "tx_ref", txRef, "err", err)
+	}
+	return s.store.GetTransaction(s.store.DB(ctx), txRef, false)
 }

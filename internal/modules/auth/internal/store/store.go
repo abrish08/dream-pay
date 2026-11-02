@@ -261,23 +261,24 @@ func (s *Store) Rehash(ctx context.Context, id, hash string, version int) error 
 
 // ---- local copy of merchant status ----
 
-func (s *Store) MerchantStatus(ctx context.Context, id string) (string, bool, error) {
+// MerchantStatus: account status and KYC status of the local copy.
+func (s *Store) MerchantStatus(ctx context.Context, id string) (status, kyc string, found bool, err error) {
 	if !validID(id) {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	var rec merchantRec
-	err := s.q(ctx).Where("id = ?", id).First(&rec).Error
+	err = s.q(ctx).Where("id = ?", id).First(&rec).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return "", false, nil
+		return "", "", false, nil
 	}
-	return rec.Status, err == nil, err
+	return rec.Status, rec.KYCStatus, err == nil, err
 }
 
-// UpsertMerchant keeps the newest status (events may arrive out of order).
-func (s *Store) UpsertMerchant(ctx context.Context, id, status string, updatedAt time.Time) error {
-	return s.q(ctx).Exec(`INSERT INTO merchants (id, status, updated_at) VALUES (?, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, updated_at = EXCLUDED.updated_at
-		WHERE merchants.updated_at <= EXCLUDED.updated_at`, id, status, updatedAt).Error
+// UpsertMerchant keeps the newest state (events may arrive out of order).
+func (s *Store) UpsertMerchant(ctx context.Context, id, status, kyc string, updatedAt time.Time) error {
+	return s.q(ctx).Exec(`INSERT INTO merchants (id, status, kyc_status, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, kyc_status = EXCLUDED.kyc_status, updated_at = EXCLUDED.updated_at
+		WHERE merchants.updated_at <= EXCLUDED.updated_at`, id, status, kyc, updatedAt).Error
 }
 
 // DB exposes the handle for events.HandleOnce.

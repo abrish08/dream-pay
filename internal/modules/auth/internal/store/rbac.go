@@ -78,10 +78,12 @@ func (r roleRec) domain() *domain.Role {
 		CreatedBy: deref(r.CreatedBy), CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
 }
 
-// EnsureRole inserts a role if its id does not exist yet (system roles).
-func (s *Store) EnsureRole(ctx context.Context, r *domain.Role) error {
+// EnsureRole inserts a role if its id does not exist yet (system roles) and
+// reports whether it was created now.
+func (s *Store) EnsureRole(ctx context.Context, r *domain.Role) (bool, error) {
 	rec := toRoleRec(r)
-	return s.q(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&rec).Error
+	res := s.q(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&rec)
+	return res.RowsAffected > 0, res.Error
 }
 
 func (s *Store) CreateRole(ctx context.Context, r *domain.Role) error {
