@@ -40,6 +40,8 @@ type Deps struct {
 	BootstrapPassword string
 	BootstrapName     string
 
+	MerchantDefaultPermissions []string // seed of the "merchant" role
+
 	Identity     map[string]*authn.OIDC // Google / Apple sign-in (only the configured ones)
 	Box          *secrets.Box           // encrypts authenticator secrets (DATA_ENCRYPTION_KEY)
 	SMS          sms.Sender             // verification codes by SMS (send.et); nil = email only
@@ -62,12 +64,13 @@ func New(d Deps) *Module {
 	base := module.NewBase(Name, d.DB, d.Bus, d.Log, nil)
 	base.Models(store.Models()...)
 	cfg := service.Config{
-		Signer:            d.Signer,
-		Pepper:            domain.Pepper{Version: d.PepperVersion, Secret: d.Pepper},
-		BootstrapEmail:    d.BootstrapEmail,
-		BootstrapPassword: d.BootstrapPassword,
-		BootstrapName:     d.BootstrapName,
-		Identity:          d.Identity, Box: d.Box, SMS: d.SMS, Mailer: d.Mailer, DashboardURL: d.DashboardURL, ResetTTL: d.ResetTTL,
+		Signer:                     d.Signer,
+		Pepper:                     domain.Pepper{Version: d.PepperVersion, Secret: d.Pepper},
+		BootstrapEmail:             d.BootstrapEmail,
+		BootstrapPassword:          d.BootstrapPassword,
+		BootstrapName:              d.BootstrapName,
+		MerchantDefaultPermissions: d.MerchantDefaultPermissions,
+		Identity:                   d.Identity, Box: d.Box, SMS: d.SMS, Mailer: d.Mailer, DashboardURL: d.DashboardURL, ResetTTL: d.ResetTTL,
 	}
 	if len(d.PreviousPepper) > 0 {
 		cfg.PreviousPepper = &domain.Pepper{Version: d.PepperVersion - 1, Secret: d.PreviousPepper}

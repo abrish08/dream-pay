@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -46,6 +47,9 @@ type Config struct {
 	BootstrapAdminEmail    string // first super_admin, created once
 	BootstrapAdminPassword string
 	BootstrapAdminName     string
+	// MerchantDefaultPermissions seed the default "merchant" role the first
+	// time it is created; afterwards staff edit the role through the API.
+	MerchantDefaultPermissions []string
 
 	EncryptionKey         []byte
 	PublicBaseURL         string
@@ -78,12 +82,29 @@ type Config struct {
 	SendEtAPIKey, SendEtSender, SendEtBaseURL string
 	SMS                                       sms.Sender // set directly by tests; overrides send.et
 
+	// KYC documents. KYC_STORAGE=minio (production: S3-compatible object
+	// storage) or local (development: encrypted files in KYCStorageDir).
+	// Only object keys are stored in the database; download links are
+	// pre-signed on every read. Uploads are capped at 5 MB.
+	KYCStorage    string
+	KYCStorageDir string
+	MinIO         MinIOConfig
+
+	// Fayda (Ethiopian national digital ID, eSignet OpenID Connect) for the
+	// merchant owner's identity. Empty client id = disabled.
+	FaydaIssuer, FaydaClientID, FaydaPrivateKey, FaydaRedirectURI, FaydaACR string
+
 	// HSTS: tell browsers to use HTTPS only (enable when served over HTTPS).
 	HSTS bool
 
 	// ProviderRoutes: payment method -> providers in order of preference,
 	// from PROVIDER_ROUTES="telebirr=telebirr;card=ethswitch,bank_x".
 	ProviderRoutes map[string][]string
+	// ProviderTestRoutes: test mode through providers' TEST accounts
+	// (PROVIDER_TEST_ROUTES=card=mpgs_test); otherwise the built-in sandbox.
+	ProviderTestRoutes map[string][]string
+	// Mastercard Gateway (MPGS): live merchant and bank TEST merchant. nil = off.
+	MPGS, MPGSTest *MPGSSettings
 
 	PaymentTTL         time.Duration
 	PaymentExpiryEvery time.Duration // how often overdue payments are checked (default 15s)
@@ -147,6 +168,7 @@ func Load() (Config, error) {
 			c.CORSOrigins = append(c.CORSOrigins, o)
 		}
 	}
+	c.MerchantDefaultPermissions = list(os.Getenv("MERCHANT_DEFAULT_PERMISSIONS"))
 	c.GoogleClientIDs = list(os.Getenv("GOOGLE_CLIENT_IDS"))
 	c.AppleClientIDs = list(os.Getenv("APPLE_CLIENT_IDS"))
 	c.GoogleJWKSURL, c.AppleJWKSURL = os.Getenv("GOOGLE_JWKS_URL"), os.Getenv("APPLE_JWKS_URL")
@@ -165,20 +187,40 @@ func Load() (Config, error) {
 	c.SendEtAPIKey, c.SendEtSender = os.Getenv("SENDET_API_KEY"), env("SENDET_SENDER", "Paygate")
 	c.SendEtBaseURL = env("SENDET_BASE_URL", "https://api.send.et/v1")
 	c.HSTS = envBool("HSTS", false)
-	c.ProviderRoutes = map[string][]string{}
-	for _, part := range strings.Split(os.Getenv("PROVIDER_ROUTES"), ";") {
-		if part = strings.TrimSpace(part); part == "" {
-			continue
+	c.KYCStorage = env("KYC_STORAGE", "local")
+	c.KYCStorageDir = env("KYC_STORAGE_DIR", "./data/kyc")
+	c.MinIO = MinIOConfig{Endpoint: os.Getenv("MINIO_ENDPOINT"), PublicEndpoint: os.Getenv("MINIO_PUBLIC_ENDPOINT"),
+		AccessKey: os.Getenv("MINIO_ACCESS_KEY"), SecretKey: os.Getenv("MINIO_SECRET_KEY"),
+		Bucket: env("MINIO_BUCKET", "kyc-documents"), Region: os.Getenv("MINIO_REGION"),
+		UseSSL: envBool("MINIO_USE_SSL", false), SSE: envBool("KYC_S3_SSE", false)}
+	c.MinIO.PublicUseSSL = envBool("MINIO_PUBLIC_USE_SSL", c.MinIO.UseSSL)
+	switch c.KYCStorage {
+	case "local":
+	case "minio":
+		if c.MinIO.Endpoint == "" || c.MinIO.AccessKey == "" || c.MinIO.SecretKey == "" {
+			return c, fmt.Errorf("KYC_STORAGE=minio needs MINIO_ENDPOINT, MINIO_ACCESS_KEY and MINIO_SECRET_KEY")
 		}
-		method, list, ok := strings.Cut(part, "=")
-		if !ok || strings.TrimSpace(method) == "" {
-			return c, fmt.Errorf("PROVIDER_ROUTES: %q must look like method=provider1,provider2", part)
-		}
-		for _, p := range strings.Split(list, ",") {
-			if p = strings.TrimSpace(p); p != "" {
-				c.ProviderRoutes[strings.TrimSpace(method)] = append(c.ProviderRoutes[strings.TrimSpace(method)], p)
-			}
-		}
+	default:
+		return c, fmt.Errorf("KYC_STORAGE must be local or minio")
+	}
+	c.FaydaIssuer = strings.TrimRight(env("FAYDA_ISSUER", "https://esignet.ida.fayda.et"), "/")
+	c.FaydaClientID, c.FaydaPrivateKey = os.Getenv("FAYDA_CLIENT_ID"), os.Getenv("FAYDA_PRIVATE_KEY")
+	c.FaydaRedirectURI = env("FAYDA_REDIRECT_URI", c.PublicBaseURL+"/kyc/fayda/callback")
+	c.FaydaACR = os.Getenv("FAYDA_ACR")
+	if (c.FaydaClientID == "") != (c.FaydaPrivateKey == "") {
+		return c, fmt.Errorf("Fayda needs both FAYDA_CLIENT_ID and FAYDA_PRIVATE_KEY")
+	}
+	if c.ProviderRoutes, err = parseRoutes("PROVIDER_ROUTES"); err != nil {
+		return c, err
+	}
+	if c.ProviderTestRoutes, err = parseRoutes("PROVIDER_TEST_ROUTES"); err != nil {
+		return c, err
+	}
+	if c.MPGS, err = mpgsFromEnv("MPGS_", ""); err != nil {
+		return c, err
+	}
+	if c.MPGSTest, err = mpgsFromEnv("MPGS_TEST_", "https://test-gateway.mastercard.com"); err != nil {
+		return c, err
 	}
 	c.PaymentTTL = 30 * time.Minute
 	if v := os.Getenv("PAYMENT_TTL"); v != "" {
@@ -235,8 +277,8 @@ func (c Config) Validate(known []string) error {
 	if len(c.AuthPublicKeys) == 0 && len(c.AuthSigningKey) == 0 {
 		return fmt.Errorf("AUTH_PUBLIC_KEYS is required: every service verifies access tokens with the auth service's public key")
 	}
-	if (c.ModuleEnabled("webhook") || c.ModuleEnabled("auth")) && len(c.EncryptionKey) != 32 {
-		return fmt.Errorf("DATA_ENCRYPTION_KEY is required by the webhook and auth modules")
+	if (c.ModuleEnabled("webhook") || c.ModuleEnabled("auth") || c.ModuleEnabled("kyc")) && len(c.EncryptionKey) != 32 {
+		return fmt.Errorf("DATA_ENCRYPTION_KEY is required by the webhook, auth and kyc modules")
 	}
 	if !c.AllEnabled(known) && c.Bus != "nats" {
 		return fmt.Errorf("MODULES runs only part of the system here: set BUS=nats so modules in other processes can be reached")
@@ -334,4 +376,54 @@ func list(v string) []string {
 		}
 	}
 	return out
+}
+
+// MinIOConfig: S3-compatible object storage for KYC documents.
+type MinIOConfig struct {
+	Endpoint, PublicEndpoint, AccessKey, SecretKey, Bucket, Region string
+	UseSSL, PublicUseSSL, SSE                                      bool
+}
+
+// MPGSSettings: a Mastercard Gateway merchant (from the acquiring bank).
+type MPGSSettings struct {
+	BaseURL, MerchantID, APIPassword, APIVersion, MerchantName, NotificationSecret string
+	Currencies                                                                     []string
+	HTTP                                                                           *http.Client // tests only (never from env)
+}
+
+func mpgsFromEnv(prefix, defaultBase string) (*MPGSSettings, error) {
+	s := &MPGSSettings{BaseURL: env(prefix+"BASE_URL", defaultBase), MerchantID: os.Getenv(prefix + "MERCHANT_ID"),
+		APIPassword: os.Getenv(prefix + "API_PASSWORD"), APIVersion: env(prefix+"API_VERSION", "100"),
+		MerchantName: os.Getenv(prefix + "MERCHANT_NAME"), NotificationSecret: os.Getenv(prefix + "NOTIFICATION_SECRET")}
+	for _, c := range list(env(prefix+"CURRENCIES", "USD")) {
+		s.Currencies = append(s.Currencies, strings.ToUpper(c))
+	}
+	if s.MerchantID == "" && s.APIPassword == "" {
+		return nil, nil // not configured
+	}
+	if s.MerchantID == "" || s.APIPassword == "" || s.BaseURL == "" {
+		return nil, fmt.Errorf("%sBASE_URL, %sMERCHANT_ID and %sAPI_PASSWORD go together", prefix, prefix, prefix)
+	}
+	return s, nil
+}
+
+// parseRoutes reads "method=provider1,provider2;method2=provider3".
+func parseRoutes(name string) (map[string][]string, error) {
+	out := map[string][]string{}
+	for _, part := range strings.Split(os.Getenv(name), ";") {
+		if part = strings.TrimSpace(part); part == "" {
+			continue
+		}
+		method, providers, ok := strings.Cut(part, "=")
+		method = strings.TrimSpace(method)
+		if !ok || method == "" {
+			return nil, fmt.Errorf("%s: %q must look like method=provider1,provider2", name, part)
+		}
+		for _, p := range strings.Split(providers, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				out[method] = append(out[method], p)
+			}
+		}
+	}
+	return out, nil
 }

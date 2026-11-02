@@ -97,6 +97,9 @@ func (s *Service) Request(ctx context.Context, actor reqctx.Principal, idemKey s
 	if err != nil {
 		return View{}, false, err
 	}
+	if in.Environment == "live" && !merchants.KYCPassed(m.KYCStatus) {
+		return View{}, false, merchants.ErrKYCRequired
+	}
 	if m.Status != merchants.StatusActive && !(m.Status == merchants.StatusPending && in.Environment == "test") {
 		return View{}, false, apperror.Forbidden("merchant_not_approved", "live payouts need an approved, active merchant")
 	}

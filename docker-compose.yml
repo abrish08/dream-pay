@@ -26,6 +26,20 @@ x-auth-secrets: &auth-secrets
   BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?create .env with ./scripts/run.sh env}
   BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?create .env with ./scripts/run.sh env}
 
+# KYC documents in MinIO (private bucket, server-side encryption). The app
+# talks to minio:9000; download links use localhost:9000 (what browsers reach).
+x-kyc-storage: &kyc-storage
+  KYC_STORAGE: minio
+  MINIO_ENDPOINT: minio:9000
+  MINIO_PUBLIC_ENDPOINT: localhost:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-paygate}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?create .env with ./scripts/run.sh env}
+  MINIO_BUCKET: kyc-documents
+  KYC_S3_SSE: "true"
+  FAYDA_CLIENT_ID: ${FAYDA_CLIENT_ID:-}
+  FAYDA_PRIVATE_KEY: ${FAYDA_PRIVATE_KEY:-}
+  FAYDA_ISSUER: ${FAYDA_ISSUER:-https://esignet.ida.fayda.et}
+
 x-service: &service
   build: .
   restart: unless-stopped
@@ -55,6 +69,21 @@ services:
       interval: 2s
       retries: 30
 
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    profiles: [mono, micro]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-paygate}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?create .env with ./scripts/run.sh env}
+      MINIO_KMS_SECRET_KEY: ${MINIO_KMS_SECRET_KEY:?create .env with ./scripts/run.sh env}  # enables SSE
+    ports: ["9000:9000", "9001:9001"]   # 9001: MinIO console
+    volumes: ["miniodata:/data"]        # KYC documents: back this volume up
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      retries: 30
+
   # ---------------- monolith ----------------
   paygate:
     build: .
@@ -62,9 +91,10 @@ services:
     profiles: [mono]
     depends_on:
       postgres: { condition: service_healthy }
+      minio: { condition: service_healthy }
     ports: ["8080:8080"]
     environment:
-      <<: [*common, *auth-secrets]
+      <<: [*common, *auth-secrets, *kyc-storage]
       MODULES: all
       BUS: memory
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/gateway?sslmode=disable
@@ -133,6 +163,17 @@ services:
       MODULES: reconciliation
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_reconciliation?sslmode=disable
 
+  kyc:
+    <<: *service
+    depends_on:
+      postgres: { condition: service_healthy }
+      nats: { condition: service_started }
+      minio: { condition: service_healthy }
+    environment:
+      <<: [*micro-env, *kyc-storage]
+      MODULES: kyc
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_kyc?sslmode=disable
+
   payout:
     <<: *service
     environment:
@@ -165,6 +206,9 @@ services:
         /v1/merchant=http://merchant:8080,
         /v1/payouts=http://payout:8080,
         /admin/payouts=http://payout:8080,
+        /v1/kyc=http://kyc:8080,
+        /admin/kyc=http://kyc:8080,
+        /kyc=http://kyc:8080,
         /admin/merchants=http://merchant:8080,
         /admin/merchants/*/api-keys=http://auth:8080,
         /providers=http://provider:8080,
@@ -181,3 +225,4 @@ services:
 
 volumes:
   pgdata:
+  miniodata:

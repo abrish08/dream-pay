@@ -24,6 +24,7 @@ type Merchant struct {
 	Website    string     `json:"website,omitempty"`
 	Status     string     `json:"status"`
 	FeeBPS     int64      `json:"fee_bps"` // platform fee in basis points: 150 = 1.5%
+	KYCStatus  string     `json:"kyc_status"`
 	ApprovedAt *time.Time `json:"approved_at,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 }
@@ -60,8 +61,17 @@ const TopicMerchantUpdated = "merchant.updated.v1"
 type MerchantUpdated struct {
 	ID        string    `json:"id"`
 	Status    string    `json:"status"`
+	KYCStatus string    `json:"kyc_status"`
 	FeeBPS    int64     `json:"fee_bps"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (MerchantUpdated) EventTopic() string { return TopicMerchantUpdated }
+
+// KYCPassed: live mode (live API keys, live payments, live payouts) needs an
+// approved business verification. "waived" exists only for merchants that
+// were live before KYC was introduced.
+func KYCPassed(kycStatus string) bool { return kycStatus == "approved" || kycStatus == "waived" }
+
+var ErrKYCRequired = apperror.Forbidden("kyc_required",
+	"live mode needs an approved business verification (KYC): submit it at /v1/kyc; test mode works without it")

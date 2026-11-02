@@ -23,6 +23,7 @@ go.work
 go.work.sum
 
 # ---- Local data & logs ----
+/data/
 *.log
 /tmp/
 /pgdata/

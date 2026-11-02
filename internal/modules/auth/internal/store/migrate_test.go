@@ -95,7 +95,7 @@ func TestAutoMigrateUpgradesWithoutLoss(t *testing.T) {
 	st := New(db)
 	now := time.Now()
 	for _, sr := range domain.SystemRoles {
-		if err := st.EnsureRole(ctx, sr.Role(now)); err != nil {
+		if _, err := st.EnsureRole(ctx, sr.Role(now)); err != nil {
 			t.Fatal(err)
 		}
 	}

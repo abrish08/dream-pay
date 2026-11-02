@@ -17,6 +17,7 @@ import (
 	"paygate/internal/app/apidocs"
 	authc "paygate/internal/contracts/auth"
 	"paygate/internal/modules/auth"
+	"paygate/internal/modules/kyc"
 	"paygate/internal/modules/ledger"
 	"paygate/internal/modules/merchant"
 	"paygate/internal/modules/payment"
@@ -40,7 +41,7 @@ import (
 // Modules is the list of every module in the system.
 var Modules = []string{
 	merchant.Name, auth.Name, provider.Name, payment.Name,
-	refund.Name, ledger.Name, webhook.Name, reconciliation.Name, payout.Name,
+	refund.Name, ledger.Name, webhook.Name, reconciliation.Name, payout.Name, kyc.Name,
 }
 
 type App struct {
@@ -122,12 +123,21 @@ func (a *App) newModule(name string) (module.Module, error) {
 			Pepper: []byte(cfg.APIKeyPepper), PepperVersion: cfg.APIKeyPepperVersion,
 			PreviousPepper: []byte(cfg.APIKeyPepperPrevious),
 			BootstrapEmail: cfg.BootstrapAdminEmail, BootstrapPassword: cfg.BootstrapAdminPassword,
-			BootstrapName: cfg.BootstrapAdminName,
-			Identity:      a.identityProviders(), Mailer: a.mailer(), SMS: a.sms(), Box: a.box(), DashboardURL: cfg.DashboardURL,
+			BootstrapName: cfg.BootstrapAdminName, MerchantDefaultPermissions: cfg.MerchantDefaultPermissions,
+			Identity: a.identityProviders(), Mailer: a.mailer(), SMS: a.sms(), Box: a.box(), DashboardURL: cfg.DashboardURL,
 			ResetTTL: cfg.PasswordResetTTL}), nil
 	case provider.Name:
+		conv := func(m *config.MPGSSettings) *provider.MPGSConfig {
+			if m == nil {
+				return nil
+			}
+			return &provider.MPGSConfig{BaseURL: m.BaseURL, MerchantID: m.MerchantID, APIPassword: m.APIPassword,
+				APIVersion: m.APIVersion, MerchantName: m.MerchantName, NotificationSecret: m.NotificationSecret,
+				Currencies: m.Currencies, HTTP: m.HTTP}
+		}
 		return provider.New(provider.Deps{DB: db, Bus: b, Log: log, PublicBaseURL: cfg.PublicBaseURL,
-			Routes: cfg.ProviderRoutes, AllowMockInLive: cfg.AllowMockInLive}), nil
+			Routes: cfg.ProviderRoutes, TestRoutes: cfg.ProviderTestRoutes, AllowMockInLive: cfg.AllowMockInLive,
+			MPGS: conv(cfg.MPGS), MPGSTest: conv(cfg.MPGSTest)})
 	case payment.Name:
 		return payment.New(payment.Deps{DB: db, Bus: b, Log: log, AllowMockInLive: cfg.AllowMockInLive,
 			PaymentTTL: cfg.PaymentTTL, ExpiryEvery: cfg.PaymentExpiryEvery, PublicBaseURL: cfg.PublicBaseURL}), nil
@@ -137,6 +147,15 @@ func (a *App) newModule(name string) (module.Module, error) {
 		return ledger.New(ledger.Deps{DB: db, Bus: b, Log: log}), nil
 	case webhook.Name:
 		return webhook.New(webhook.Deps{DB: db, Bus: b, Log: log, EncryptionKey: cfg.EncryptionKey, AllowInsecure: cfg.AllowInsecureWebhooks})
+	case kyc.Name:
+		mc := cfg.MinIO
+		return kyc.New(kyc.Deps{DB: db, Bus: b, Log: log, Box: a.box(), Mailer: a.mailer(),
+			Storage: cfg.KYCStorage, StorageDir: cfg.KYCStorageDir, PublicBaseURL: cfg.PublicBaseURL,
+			DashboardURL: cfg.DashboardURL, SigningSecret: cfg.EncryptionKey,
+			MinIO: kyc.MinIOConfig{Endpoint: mc.Endpoint, PublicEndpoint: mc.PublicEndpoint, AccessKey: mc.AccessKey,
+				SecretKey: mc.SecretKey, Bucket: mc.Bucket, Region: mc.Region, UseSSL: mc.UseSSL, PublicUseSSL: mc.PublicUseSSL, SSE: mc.SSE},
+			FaydaIssuer: cfg.FaydaIssuer, FaydaClientID: cfg.FaydaClientID, FaydaPrivateKey: cfg.FaydaPrivateKey,
+			FaydaRedirectURI: cfg.FaydaRedirectURI, FaydaACR: cfg.FaydaACR})
 	case payout.Name:
 		return payout.New(payout.Deps{DB: db, Bus: b, Log: log}), nil
 	case reconciliation.Name:

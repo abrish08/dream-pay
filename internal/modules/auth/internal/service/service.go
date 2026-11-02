@@ -51,6 +51,9 @@ type Config struct {
 	BootstrapPassword string
 	BootstrapName     string
 
+	// MerchantDefaultPermissions seed the "merchant" role once (empty = built-in list).
+	MerchantDefaultPermissions []string
+
 	Identity     map[string]*authn.OIDC // "google", "apple": enabled when client ids are configured
 	Box          *secrets.Box           // encrypts authenticator secrets
 	SMS          sms.Sender             // verification codes by SMS (send.et); nil = email only
@@ -359,7 +362,7 @@ func (s *Service) CreateUser(ctx context.Context, actor reqctx.Principal, in Cre
 	switch {
 	case actor.IsPlatform() && actor.Can(auth.UsersManage):
 		if in.MerchantID != "" {
-			if _, err := s.merchantStatus(ctx, in.MerchantID); err != nil {
+			if _, _, err := s.merchantStatus(ctx, in.MerchantID); err != nil {
 				return UserView{}, err
 			}
 		}
@@ -371,6 +374,9 @@ func (s *Service) CreateUser(ctx context.Context, actor reqctx.Principal, in Cre
 	refs := in.Roles
 	if in.Role != "" {
 		refs = append(refs, in.Role)
+	}
+	if len(refs) == 0 && in.MerchantID != "" {
+		refs = []string{auth.RoleMerchant} // a merchant account without a chosen role gets the default
 	}
 	if len(refs) == 0 {
 		return UserView{}, errNeedRole
@@ -752,36 +758,37 @@ func (s *Service) ExchangeAPIKey(ctx context.Context, raw string) (auth.AccessTo
 
 func (s *Service) OnMerchantUpdated(ctx context.Context, env bus.Envelope, e merchants.MerchantUpdated) error {
 	return events.HandleOnce(ctx, s.store.DB(), "auth.on_merchant_updated", env, func(tx *gorm.DB) error {
-		return store.New(tx).UpsertMerchant(ctx, e.ID, e.Status, e.UpdatedAt)
+		return store.New(tx).UpsertMerchant(ctx, e.ID, e.Status, e.KYCStatus, e.UpdatedAt)
 	})
 }
 
-// merchantStatus reads the local copy, asking the merchant service only for a
-// merchant this service has not heard of yet.
-func (s *Service) merchantStatus(ctx context.Context, id string) (string, error) {
-	status, found, err := s.store.MerchantStatus(ctx, id)
-	if err != nil || found {
-		return status, err
+// merchantStatus reads the local copy (account status, KYC status), asking
+// the merchant service only for a merchant this service does not know yet
+// (or whose KYC status it never received).
+func (s *Service) merchantStatus(ctx context.Context, id string) (status, kyc string, err error) {
+	status, kyc, found, err := s.store.MerchantStatus(ctx, id)
+	if err != nil || (found && kyc != "") {
+		return status, kyc, err
 	}
 	m, err := bus.Ask(ctx, s.bus, merchants.GetMerchant{ID: id})
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	// Epoch timestamp: any merchant.updated event will overwrite this row.
-	if err := s.store.UpsertMerchant(ctx, m.ID, m.Status, time.Unix(0, 0).UTC()); err != nil {
-		return "", err
+	if err := s.store.UpsertMerchant(ctx, m.ID, m.Status, m.KYCStatus, time.Unix(0, 0).UTC()); err != nil {
+		return "", "", err
 	}
-	return m.Status, nil
+	return m.Status, m.KYCStatus, nil
 }
 
-// merchantAllowed: platform staff ("") always pass. A pending merchant
-// (signed up, not approved yet) can log in and use test mode; live mode
-// (live keys) needs an approved, active merchant.
+// merchantAllowed: platform staff ("") always pass. Test mode: an active or
+// pending merchant (no KYC needed). Live mode (live API keys): an active
+// merchant whose business verification (KYC) is approved.
 func (s *Service) merchantAllowed(ctx context.Context, merchantID string, live bool) error {
 	if merchantID == "" {
 		return nil
 	}
-	status, err := s.merchantStatus(ctx, merchantID)
+	status, kyc, err := s.merchantStatus(ctx, merchantID)
 	if errors.Is(err, merchants.ErrNotFound) {
 		return auth.ErrMerchantInactive
 	}
@@ -789,14 +796,16 @@ func (s *Service) merchantAllowed(ctx context.Context, merchantID string, live b
 		return err
 	}
 	switch {
-	case status == merchants.StatusActive:
+	case status != merchants.StatusActive && status != merchants.StatusPending:
+		return auth.ErrMerchantInactive
+	case !live:
 		return nil
-	case status == merchants.StatusPending && !live:
-		return nil
+	case !merchants.KYCPassed(kyc):
+		return merchants.ErrKYCRequired
 	case status == merchants.StatusPending:
 		return errNotApproved
 	}
-	return auth.ErrMerchantInactive
+	return nil
 }
 
 // ---- Merchant self-signup ----
@@ -811,10 +820,10 @@ type SignupInput struct {
 	Channel      string `json:"verification_channel"` // email (default) or sms
 }
 
-// Signup creates a pending merchant and its owner, and logs the owner in.
-// Test mode works at once; live keys wait until staff approve the merchant.
-// Signup creates a pending merchant and its owner, then sends a 6-digit code.
-// No token is issued until the code is confirmed (POST /auth/verify).
+// Signup creates a pending merchant and its first user (default "merchant"
+// role), then sends a 6-digit code. No token is issued until the code is
+// confirmed (POST /auth/verify). Test mode works right after; live mode
+// needs an approved business verification (KYC).
 func (s *Service) Signup(ctx context.Context, in SignupInput) (SignupResult, error) {
 	if strings.TrimSpace(in.Name) == "" {
 		in.Name = in.BusinessName
@@ -838,15 +847,15 @@ func (s *Service) Signup(ctx context.Context, in SignupInput) (SignupResult, err
 		return SignupResult{}, err
 	}
 	// Known locally right away (the merchant.updated event may arrive later).
-	if err := s.store.UpsertMerchant(ctx, m.ID, m.Status, time.Unix(0, 0).UTC()); err != nil {
+	if err := s.store.UpsertMerchant(ctx, m.ID, m.Status, m.KYCStatus, time.Unix(0, 0).UTC()); err != nil {
 		return SignupResult{}, err
 	}
-	u.MerchantID, u.Role = m.ID, auth.RoleOwner
+	u.MerchantID, u.Role = m.ID, auth.RoleMerchant // default role; staff choose its permissions
 	err = s.store.Tx(ctx, func(st *store.Store) error {
 		if err := st.CreateUser(ctx, u); err != nil {
 			return err
 		}
-		if _, err := st.AssignRole(ctx, u.ID, domain.SystemRoleID(auth.RoleOwner), "", u.CreatedAt); err != nil {
+		if _, err := st.AssignRole(ctx, u.ID, domain.SystemRoleID(auth.RoleMerchant), "", u.CreatedAt); err != nil {
 			return err
 		}
 		return st.Audit(ctx, store.Audit{ActorID: u.ID, MerchantID: m.ID, Action: "merchant.signed_up",

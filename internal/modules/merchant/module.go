@@ -47,7 +47,8 @@ func (m *Module) RegisterRoutes(r module.Routers) {
 }
 
 // Handles: merchants.GetMerchant, merchants.CreateMerchant (self-signup).
-// Publishes: merchants.MerchantUpdated.
+// Publishes: merchants.MerchantUpdated. Subscribes: kyc.StatusChanged.
 func (m *Module) RegisterHandlers(b bus.Bus) {
 	transport.RegisterBus(b, m.svc)
+	bus.On(b, "merchant.on_kyc_status_changed", m.svc.OnKYCStatusChanged)
 }

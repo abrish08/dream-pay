@@ -28,7 +28,7 @@ func TestAPIDocsCoverEveryRoute(t *testing.T) {
 		t.Skip("TEST_DATABASE_URL not set")
 	}
 	resetSchemas(t, dbURL)
-	cfg := config.Config{DatabaseURL: dbURL, DBMaxConns: 2, Bus: "memory",
+	cfg := config.Config{KYCStorageDir: t.TempDir(), DatabaseURL: dbURL, DBMaxConns: 2, Bus: "memory",
 		AuthSigningKey: bytes.Repeat([]byte{7}, 32), APIKeyPepper: strings.Repeat("p", 32), APIKeyPepperVersion: 1,
 		EncryptionKey: bytes.Repeat([]byte{1}, 32), PublicBaseURL: "http://localhost"}
 	a, err := app.Build(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -39,7 +39,9 @@ func TestAPIDocsCoverEveryRoute(t *testing.T) {
 
 	served := map[string]bool{}
 	err = chi.Walk(a.Routes(), func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
-		route = strings.TrimSuffix(route, "/")
+		if route != "/" {
+			route = strings.TrimSuffix(route, "/")
+		}
 		if strings.Contains(route, "/*") {
 			return nil
 		}

@@ -11,6 +11,7 @@ import (
 	"paygate/internal/contracts/payouts"
 	"paygate/internal/contracts/refunds"
 	"paygate/internal/platform/apperror"
+	"paygate/internal/platform/netguard"
 	"paygate/internal/platform/secrets"
 )
 
@@ -68,8 +69,17 @@ func ValidateURL(raw string, allowInsecure bool) error {
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
 		return apperror.Invalid("invalid_url", "url must be an absolute http(s) URL")
 	}
-	if u.Scheme == "http" && !allowInsecure {
+	if allowInsecure {
+		return nil // development only: plain http and local addresses allowed
+	}
+	if u.Scheme == "http" {
 		return apperror.Invalid("invalid_url", "webhook URLs must use https")
+	}
+	if u.User != nil {
+		return apperror.Invalid("invalid_url", "webhook URLs must not contain credentials")
+	}
+	if netguard.CheckHost(u.Hostname()) != nil {
+		return apperror.Invalid("invalid_url", "webhook URLs must point to a public internet address")
 	}
 	return nil
 }

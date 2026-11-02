@@ -132,13 +132,14 @@ whether its peer is in-process or in another service.
 
 | Module | Handles (requests) | Asks | Publishes | Subscribes |
 |---|---|---|---|---|
-| **merchant** | `merchants.GetMerchant`, `CreateMerchant` | – | `MerchantUpdated` | – |
+| **merchant** | `merchants.GetMerchant`, `CreateMerchant` | – | `MerchantUpdated` | `kyc.StatusChanged` (approval activates) |
 | **auth** | `auth.ExchangeAPIKey`, `RegisterPermissions` | `GetMerchant`, `CreateMerchant` (signup) | `AccessChanged` | `MerchantUpdated` |
 | **provider** | `providers.InitiateCheckout`, `VerifyTransaction`, `Refund` | – | `providers.TransactionUpdated` | – |
 | **payment** | `payments.GetPayment`, `ListPayments` | `GetMerchant`, `InitiateCheckout`, `VerifyTransaction` (expiry) | `PaymentSucceeded`, `PaymentFailed`, `PaymentExpired` | `TransactionUpdated`, `RefundSucceeded` |
 | **refund** | – | `GetPayment`, `providers.Refund` | `RefundSucceeded`, `RefundFailed` | – |
 | **ledger** | `ledger.ReserveFunds` | – | – | `PaymentSucceeded`, `RefundSucceeded`, `PayoutPaid`, `PayoutFailed` |
 | **payout** | – | `GetMerchant`, `ReserveFunds` | `PayoutPaid`, `PayoutFailed` | – |
+| **kyc** | – | `GetMerchant` (email) | `kyc.StatusChanged` | – |
 | **webhook** | – | – | – | payment.\*, refund.\*, payout.\* |
 | **reconciliation** | – | `ListPayments`, `VerifyTransaction` | – | – |
 
@@ -282,8 +283,10 @@ user        has many roles; token permissions = union of all its roles
   `DefaultRoles`. Later edits to those roles are never overwritten.
 * **Built-in roles** (created once): platform `super_admin` (every platform
   permission, locked), `operations`, `finance`, `support`; merchant templates
-  `owner` (every merchant permission, locked), `admin`, `developer`,
-  `analyst`, `viewer`. Platform staff can edit the non-locked ones; merchants
+  **`merchant`** (the default role of every new merchant account; its
+  permissions are seeded once from `MERCHANT_DEFAULT_PERMISSIONS` and then
+  chosen by platform staff), `owner` (every merchant permission, locked),
+  `admin`, `developer`, `analyst`, `viewer`. Platform staff can edit the non-locked ones; merchants
   create their own **custom roles**.
 * **Tokens.** At login/refresh auth merges the user's roles into the signed
   token (`roles`, `permissions`). Services check the token only, with no lookup.
@@ -411,25 +414,53 @@ Identity), never in Git or the database.
 * In production, secure NATS with TLS and per-service credentials (each
   service may only answer its own routes and publish its own events), and
   keep it on a private network.
-* Webhook delivery never follows redirects; `http://` URLs are rejected unless
-  `WEBHOOK_ALLOW_INSECURE=true` (development only).
+* Webhooks cannot be aimed at internal systems (SSRF): URLs must be `https`,
+  without credentials, and not point at loopback, private, link-local or cloud
+  metadata addresses (`169.254.169.254`) or internal names (`localhost`,
+  `*.internal`). The address is checked again at connect time, after DNS, so
+  a public name that resolves to an internal IP is refused too. Delivery
+  never follows redirects and ignores proxy settings.
+  `WEBHOOK_ALLOW_INSECURE=true` lifts these checks (development only).
+* KYC documents: private bucket, short-lived signed links, 5 MB limit (see
+  "Merchant verification").
 
 ## Tests
 
 ```bash
 go test -race ./...                                   # unit tests
-TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/paygate_test?sslmode=disable \
-TEST_NATS_URL=nats://localhost:4222 \
-  go test -race -count=1 ./internal/app/ ./internal/platform/bus/   # full flow + cross-process bus
+# end-to-end (needs a THROWAWAY database whose name contains "test": it is wiped)
+createdb paygate_test
+TEST_DATABASE_URL=postgres://postgres:<password>@localhost:5432/paygate_test?sslmode=disable \
+  go test -race -count=1 ./internal/app/
+# business scenarios only, narrated step by step
+TEST_DATABASE_URL=… go test -count=1 ./internal/app/ -run TestScenarios -v
 ./scripts/check-boundaries.sh                         # no module may import another
 ```
 
-The full-flow test covers onboarding, idempotency (replay and conflict),
-checkout, event propagation, balances, partial and over-refunds, a
-provider-declined refund, signature checks on every webhook, the trial
-balance, reconciliation, scopes and merchant suspension. The bus test runs
-two separate NATS clients to prove requests, typed errors and events cross
-process boundaries.
+**Scenario tests** (`internal/app/scenarios_test.go`) run real business stories
+on one running instance, across every service:
+
+| # | Scenario |
+|---|---|
+| S01 | Merchant signs up, verifies email, sells in test mode, passes KYC, issues a live key and takes a live payment |
+| S02 | Customer pays an order with telebirr; signed `payment.succeeded` webhook with the order metadata; balance net of fee |
+| S03 | Customer chooses the method on the hosted checkout page (CBE Birr) |
+| S04 | Customer declines: payment fails, nothing credited, refund impossible |
+| S05 | Abandoned checkout expires (`payment.expired`); a late payment is still honoured |
+| S06 | Refunds: partial, provider decline, over-refund refused, "refund the rest" |
+| S07 | Settlement: payout held, paid, a failed transfer released; payout webhooks |
+| S08 | Network retries never double-charge (idempotency replay and conflict) |
+| S09 | Merchant invites a developer with limited access |
+| S10 | Merchant's webhook endpoint is down, then recovers (retry) |
+| S11 | Forgot password: email reset ends every old session |
+| S12 | Suspension blocks a merchant everywhere; reactivation restores it; no KYC bypass |
+| S13 | Staff change what every merchant may do (default role), effective within seconds |
+| S14 | Reconciliation completes and the ledger balances after all of the above |
+
+Other end-to-end tests cover every endpoint with its Swagger sample, the docs
+covering every route, concurrency races (same idempotency key, parallel
+refunds and payouts), rate limits, KYC, MFA, Google/Apple sign-in and pepper
+rotation. `TEST_NATS_URL` adds the cross-process bus test.
 
 ## Database migrations
 
@@ -516,6 +547,130 @@ How concurrency is handled:
 * `TestConcurrency` proves these with goroutines on every test run, and the
   whole suite passes under Go's race detector (`go test -race ./...`).
 
+## Default merchant role
+
+Every new merchant account (signup, Google/Apple, or created by staff without
+a role) gets the built-in **`merchant`** role. It is seeded once, like the
+first admin, from `MERCHANT_DEFAULT_PERMISSIONS` in `.env`; after that
+platform staff decide what merchants may do:
+
+```
+GET    /admin/roles?audience=merchant                → find the "merchant" role id
+POST   /admin/roles/{id}/permissions  {"permissions": ["payouts:write"]}   add
+DELETE /admin/roles/{id}/permissions/refunds:write                          remove
+```
+
+Changes apply to **every merchant** within seconds (their tokens become stale
+and refresh with the new permissions). Merchants cannot edit this shared role;
+they can create their own custom roles for their team, within the permissions
+they hold.
+
+## Merchant verification (KYC)
+
+A self-signed-up merchant starts **pending**: test mode works, live mode does
+not. To go live it completes the business verification:
+
+```
+PUT  /v1/kyc/profile        business type, legal name, TIN (10 digits), trade license number
+                            and expiry, registration number, VAT, applicant role, address, owner
+POST /v1/kyc/fayda/start    owner signs in with Fayda (national digital ID) → details locked
+POST /v1/kyc/documents      multipart: type + file (PDF / JPEG / PNG, max 5 MB)
+POST /v1/kyc/submit         422 kyc_incomplete lists anything missing
+        ↓  staff: GET /admin/kyc?status=submitted → review, open documents
+POST /admin/kyc/{merchantId}/approve   → kyc.status_changed → merchant becomes ACTIVE
+POST /admin/kyc/{merchantId}/reject    {reason} → merchant fixes and resubmits
+```
+
+### Documents (Ethiopian requirements)
+
+`GET /v1/kyc` → `required_documents` is computed from the profile:
+
+| Document | Required for |
+|---|---|
+| `trade_license` (valid; expired licenses block submission) | every business except NGOs |
+| `commercial_registration` | every business except NGOs |
+| `registration_certificate` (ACSO) | NGOs |
+| `tin_certificate` | everyone |
+| `memorandum_of_association`, `shareholders_list` | PLC, share company, partnership |
+| `vat_certificate` | `vat_registered: true` (with `vat_number`) |
+| `business_address_proof` (lease or title deed) | everyone |
+| `bank_account_proof` (bank letter or statement) | everyone |
+| `owner_id` (passport / residence permit) | owner **not** verified with Fayda |
+| `power_of_attorney` | `applicant_role: authorized_representative` |
+| `investment_permit` | `foreign_owned: true` |
+| `certificate_of_competence` | `regulated_sector: true` |
+
+Files: PDF, JPEG or PNG, **at most 5 MB** (checked on the request body and on
+the file; larger → `413 file_too_large`). The type is detected from the bytes,
+not the name.
+
+### Owner identity with Fayda
+
+With `owner.id_type: "fayda"` the owner proves who they are through Fayda's
+eSignet (OpenID Connect), instead of uploading an ID scan:
+
+```
+POST /v1/kyc/fayda/start  → {authorize_url}     dashboard opens it
+  owner signs in at Fayda (OTP to their Fayda phone) and consents
+GET  /kyc/fayda/callback  ← Fayda (state + one-time code)
+  → <DASHBOARD_URL>/kyc?fayda=verified   (or ?fayda=failed&reason=...)
+```
+
+* Client authentication with a signed JWT (`private_key_jwt`, RS256) — no
+  shared secret; PKCE (S256), `state` and `nonce` per attempt; sessions are
+  single use and expire in 10 minutes; the ID token and the signed user info
+  are verified against Fayda's published keys.
+* Name, birth date, gender, phone, nationality, address and photo come from
+  Fayda and **lock** the owner fields (`owner_identity_locked`); under-18 owners
+  are refused; the national ID number is masked when shown; everything is
+  encrypted in the database. Staff see the Fayda photo next to the documents.
+* Setup: register as a relying party at partner.fayda.et (NBE-licensed
+  institutions go through ETSwitch), register the public key and the
+  redirect URI `<PUBLIC_BASE_URL>/kyc/fayda/callback`, then set
+  `FAYDA_CLIENT_ID` and `FAYDA_PRIVATE_KEY`. Without them Fayda is off
+  (`fayda_available: false`) and owners upload `owner_id`.
+
+### Storage: object keys in the database, links on read
+
+```
+upload  → MinIO  kyc-documents/kyc/<merchantId>/<documentId>.pdf   (private bucket, SSE)
+DB      → object_key = "kyc/<merchantId>/<documentId>.pdf"         (never a URL)
+read    → GET /v1/kyc, /v1/kyc/documents/{id}
+          → pre-signed URL built now, valid 5 minutes
+```
+
+* `KYC_STORAGE=minio` (production): any S3-compatible store. The bucket is
+  created private at start-up; no public policy is ever set. With
+  `KYC_S3_SSE=true` objects are encrypted by the server (MinIO KMS).
+  `MINIO_PUBLIC_ENDPOINT` is the host in links (e.g. `files.example.com`
+  behind TLS), `MINIO_ENDPOINT` the internal address. Use an access key
+  limited to the bucket.
+* `KYC_STORAGE=local` (development): files encrypted with AES-256-GCM in
+  `KYC_STORAGE_DIR`, each bound to its key; links are HMAC-signed, expiring
+  `/kyc/files/{token}` URLs served by the gateway.
+* Why keys, not URLs: a link leaked from a log or an email stops working in
+  minutes, access can be revoked by deleting the object, and the bucket, host
+  or CDN can change without touching a single database row. Keys are built
+  only from ids and validated (`kyc/<uuid>/<uuid>.pdf|jpg|png`), so they can
+  never point outside the KYC prefix.
+
+### Rules
+
+* **Test mode never needs KYC; live mode always does.** Live API keys, live
+  payments and live payouts require an approved verification for every
+  merchant, including merchants created by staff (`403 kyc_required`).
+  KYC can be submitted at any time. Platform staff never go through KYC.
+  Approval also activates a pending (self-signed-up) merchant; staff cannot
+  activate it without approved KYC (`409 kyc_not_approved`). Merchants that
+  were live before KYC existed are marked `waived`.
+* The owner's personal data and the Fayda identity are encrypted in the
+  database; a SHA-256 of each file is kept to prove which file was approved.
+* **Everything is recorded** in `kyc_history` (uploads, Fayda verifications
+  and failures, submissions, every staff document view, decisions with
+  reasons). The merchant is emailed on submit, approval and rejection.
+* Permissions: merchants `kyc:read` / `kyc:write` (owner, admin; logged-in users
+  only, never API keys); staff `kyc:review` (operations by default).
+
 ## Payment providers: hybrid model (direct + backup)
 
 Merchants ask for a **payment method**, never a provider:
@@ -537,19 +692,141 @@ This is the hybrid path: start a method on whatever connection is signed
 first, then move it to a direct integration by changing one line of
 `PROVIDER_ROUTES`. Merchants and their code never change.
 
-**Today only the sandbox adapter is installed**: test mode works for every
-method; live methods report `payment_method_unavailable` until a direct
-adapter is added. Each adapter is one file implementing `gateway.Gateway`
+**Installed adapters:** the sandbox (test mode, every method) and the
+Mastercard Gateway for cards (`mpgs` / `mpgs_test`, see below). Other live
+methods report `payment_method_unavailable` until a direct adapter is added. Each adapter is one file implementing `gateway.Gateway`
 (`internal/modules/provider/internal/gateway/gateway.go` lists the rules) and
 needs the provider's API specification and test credentials. What to request
 from each provider: [docs/PROVIDER_ONBOARDING.md](docs/PROVIDER_ONBOARDING.md).
 
+## Card payments in USD: Mastercard Gateway (MPGS)
+
+Card payments (Visa, Mastercard) go through **Mastercard Payment Gateway
+Services**, which Ethiopian acquiring banks give to their e-commerce
+merchants. paygate uses **Hosted Checkout**: the customer types the card on
+Mastercard's page, so card numbers never reach paygate (PCI DSS SAQ A).
+
+```
+POST /v1/payments {"amount": 5000, "currency": "USD", "payment_method": "card", "reference": "...", "return_url": "..."}
+  → paygate: INITIATE_CHECKOUT at MPGS (order id = payment id, PURCHASE)
+  → checkout_url = /providers/mpgs/pay/{id}?session=...   (loads Mastercard's checkout.min.js)
+customer: card + 3-D Secure on Mastercard's page
+  → /providers/mpgs/return/{id}: paygate reads the order from MPGS (never trusts the URL)
+  → payment succeeded → ledger: merchant USD balance +49.25, fee 0.75 → webhook payment.succeeded
+  → customer redirected to return_url
+MPGS webhook → /providers/mpgs/callback (X-Notification-Secret) → same verification
+POST /v1/refunds → REFUND at MPGS (transaction id = refund id: never refunded twice)
+```
+
+* **Money:** the customer's bank charges the card in USD, MPGS and the
+  acquiring bank settle USD to the merchant account the bank holds (per the
+  bank's settlement terms and NBE rules); paygate's ledger keeps USD separate
+  from ETB, and payouts of USD go to a USD account.
+* **Safety:** the order status and amount are always read from MPGS; an amount
+  or currency mismatch fails the payment. Webhooks need the shared secret.
+  Authentication or network errors count as "provider down" (failover and
+  circuit breaker); a pending refund stays pending and is checked again.
+  The card page has its own strict CSP (only Mastercard's host and our
+  nonce-tagged script).
+* **Test vs live:** `mpgs` is the bank's live merchant, used only by live
+  payments (`PROVIDER_ROUTES=card=mpgs`). `mpgs_test` is the bank's TEST
+  merchant, used only by test mode (`PROVIDER_TEST_ROUTES=card=mpgs_test`),
+  where Mastercard's test cards work. The router never mixes them.
+* **What to get from the bank:** card acquiring agreement for e-commerce
+  (USD, and ETB if offered), the MPGS gateway host, a TEST and a live merchant
+  id with API passwords (Merchant Administration → Integration Settings), the
+  API version they enable, a webhook secret, and approval of your return URL
+  domain. Then set the `MPGS_*` variables (see `.env.example`).
+
+### Going live with Mastercard (production checklist)
+
+The adapter is a real HTTPS client for Mastercard's REST API; the simulator
+(`internal/modules/provider/mpgstest`, `cmd/mpgs-sim`) is never compiled into
+the `paygate` binary or the Docker image.
+
+1. **Credentials from the acquiring bank:** the gateway host (e.g.
+   `https://ap-gateway.mastercard.com`, `https://eu-gateway.mastercard.com`
+   or the bank's own MPGS host; never just `https://mastercard.com`), a TEST
+   and a live merchant id (format is bank-specific), an API password for each,
+   the API version and a webhook secret.
+2. **Configure both, side by side:** live payments use `mpgs`, test mode keeps
+   using the TEST merchant:
+   ```
+   PROVIDER_ROUTES=card=mpgs                 # live
+   PROVIDER_TEST_ROUTES=card=mpgs_test       # test mode (keep it)
+   MPGS_BASE_URL=https://<host from the bank>
+   MPGS_MERCHANT_ID=...    MPGS_API_PASSWORD=...    MPGS_NOTIFICATION_SECRET=...
+   MPGS_TEST_BASE_URL=https://<test host from the bank>
+   MPGS_TEST_MERCHANT_ID=TEST...   MPGS_TEST_API_PASSWORD=...
+   MPGS_CURRENCIES=USD     # only what the bank settles for this merchant account
+   ```
+3. **What paygate enforces:** the live merchant must use `https` to a public
+   host (plain http is accepted only for the local simulator as the TEST
+   merchant); TLS 1.2 or newer; no redirects followed; Basic auth
+   `merchant.<id>` sent only to that host.
+4. **Health check at start-up**, for each merchant:
+   `GET /api/rest/version/{v}/information` (status must be `OPERATING`) and
+   `GET .../merchant/{id}/paymentOptionsInquiry` (credentials accepted).
+   Rejected credentials **stop start-up** with a clear message; an
+   unreachable gateway is logged as `ALERT: Mastercard Gateway check failed`
+   and start-up continues (the circuit breaker then reports card as
+   unavailable until Mastercard answers). Alert on that log line, on
+   `provider_unavailable` errors and on `GET /admin/providers` showing card
+   unhealthy.
+5. **PCI DSS:** Hosted Checkout keeps card data on Mastercard's page, so
+   paygate never sees, logs or stores a card number, CVV or expiry
+   (self-assessment SAQ A). 3-D Secure is run by Mastercard and the issuer.
+6. **Before real customers:** pass the bank's UAT on the TEST merchant
+   (approved, declined, insufficient funds, 3-D Secure failure, refund,
+   webhook), have the bank whitelist your return/webhook domain (https),
+   then do a penny test: a real $1.00 payment and refund on the live
+   merchant, and confirm it on the bank settlement report.
+
+### Try card payments locally (Mastercard simulator)
+
+No bank account needed: `cmd/mpgs-sim` simulates the Mastercard Gateway,
+including its hosted card page and 3-D Secure.
+
+```bash
+go run ./cmd/mpgs-sim        # http://127.0.0.1:9100, prints the test cards
+# in .env (test mode only):
+PROVIDER_TEST_ROUTES=card=mpgs_test
+MPGS_TEST_BASE_URL=http://127.0.0.1:9100
+MPGS_TEST_MERCHANT_ID=TESTPAYGATE
+MPGS_TEST_API_PASSWORD=sim-password
+MPGS_TEST_CURRENCIES=USD,ETB
+```
+
+Create a test payment with `"payment_method": "card"` and open its
+`checkout_url`. Cards: `5123 4500 0000 0008` (Mastercard), `4508 7500 1574 1019`
+(Visa), any 3-digit CVV, 3-D Secure code `123456`. The expiry decides the
+bank's answer:
+
+| Expiry | Result | Payment |
+|---|---|---|
+| `01/39` (or any other future date) | approved | `succeeded` |
+| `02/39` | insufficient funds | `failed`, `failure_reason: insufficient_funds` |
+| `05/39` | declined | `failed`, `declined` |
+| `04/27` | bank says expired | `failed`, `expired_card` |
+| `08/28` | bank timeout | `failed`, `timed_out` |
+| wrong 3-D Secure code | authentication failed | `failed`, `authentication_failed` |
+
+An invalid number (wrong check digit), a past expiry or a bad CVV is refused
+on the card page itself, before the bank is asked. After a decline the
+customer stays on the card page and may try another card; if they pay, the
+payment becomes `succeeded` even if it was already marked failed (the
+captured money always wins).
+
 ## Not included yet
 
-* Direct provider adapters (telebirr, CBE Birr, M-Pesa, card switch, banks):
-  routing, failover and the hosted page are ready; each adapter needs the
-  provider's licensed API documents and credentials.
-* KYC document upload and review (signup + staff approval exist).
+* Direct provider adapters for telebirr, CBE Birr, M-Pesa and banks (cards
+  are done: Mastercard Gateway); each needs the provider's licensed API
+  documents and credentials.
+* Currency conversion (pricing in USD, settling in ETB): USD is processed and
+  kept as USD today.
+* KYC checks against business registries (ERCA TIN lookup, MoTRI trade
+  registry) and sanctions / PEP screening: staff verify the documents
+  manually (the owner's identity can already be verified with Fayda).
 * Automatic payouts through a bank transfer API (today finance sends the
   transfer and marks the payout paid).
 * Customer receipts by email; WebAuthn / passkeys as a second factor.

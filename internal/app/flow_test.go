@@ -48,7 +48,7 @@ func TestPaymentFlow(t *testing.T) {
 	defer hookSrv.Close()
 	outbox := &mail.Memory{}
 
-	cfg := config.Config{
+	cfg := config.Config{KYCStorageDir: t.TempDir(),
 		DatabaseURL: dbURL, DBMaxConns: 5, Bus: "memory",
 		AuthSigningKey: bytes.Repeat([]byte{7}, 32), APIKeyPepper: strings.Repeat("p", 32), APIKeyPepperVersion: 1,
 		AuthKeyCacheTTL:     0, // revocation takes effect immediately in this test
@@ -332,8 +332,13 @@ func (c *client) rbacChecks(owner, dev, devID string) {
 		"password": "z-password-123456", "roles": []string{"super_admin"}}, 403)
 }
 
+// resetSchemas DROPS every module schema of the test database. To protect
+// real data it refuses any database whose name does not contain "test".
 func resetSchemas(t *testing.T, dbURL string) {
 	t.Helper()
+	if u, err := url.Parse(dbURL); err != nil || !strings.Contains(strings.ToLower(u.Path), "test") {
+		t.Fatalf("TEST_DATABASE_URL must name a throwaway database containing \"test\" (e.g. paygate_test): the tests wipe it")
+	}
 	db, err := database.Open(dbURL, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -446,11 +451,22 @@ func (c *client) eventually(what string, cond func() bool) {
 
 // receiver is a merchant's webhook endpoint that verifies signatures.
 type receiver struct {
-	mu     sync.Mutex
-	secret string
-	calls  int
-	bad    int
-	byType map[string]int
+	mu       sync.Mutex
+	secret   string
+	calls    int
+	bad      int
+	byType   map[string]int
+	lastBody map[string]map[string]any // newest payload per event type
+	failing  bool                      // simulate an outage: answer 500
+}
+
+func (r *receiver) setFailing(f bool) { r.mu.Lock(); defer r.mu.Unlock(); r.failing = f }
+
+// last returns the newest event of a type ("data" holds the object).
+func (r *receiver) last(eventType string) map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastBody[eventType]
 }
 
 func (r *receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -472,7 +488,18 @@ func (r *receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if r.byType == nil {
 		r.byType = map[string]int{}
 	}
+	if r.failing {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	r.byType[req.Header.Get("Paygate-Event-Type")]++
+	if r.lastBody == nil {
+		r.lastBody = map[string]map[string]any{}
+	}
+	var ev map[string]any
+	if json.Unmarshal(body, &ev) == nil {
+		r.lastBody[req.Header.Get("Paygate-Event-Type")] = ev
+	}
 	expected := secrets.HMACHex([]byte(r.secret), append([]byte(fmt.Sprintf("%d.", ts)), body...))
 	if !secrets.EqualHex(sig, expected) || time.Since(time.Unix(ts, 0)) > 5*time.Minute {
 		r.bad++
@@ -517,7 +544,7 @@ func TestPepperRotation(t *testing.T) {
 	}
 	resetSchemas(t, dbURL)
 	ctx := context.Background()
-	base := config.Config{
+	base := config.Config{KYCStorageDir: t.TempDir(),
 		DatabaseURL: dbURL, DBMaxConns: 3, Bus: "memory", AuthSigningKey: bytes.Repeat([]byte{7}, 32),
 		BootstrapAdminEmail: "admin@paygate.test", BootstrapAdminPassword: "admin-password-123",
 		EncryptionKey: bytes.Repeat([]byte{1}, 32), PublicBaseURL: "http://localhost", AllowInsecureWebhooks: true,

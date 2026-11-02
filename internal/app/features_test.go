@@ -34,7 +34,7 @@ func startApp(t *testing.T, tweak func(*config.Config)) (*client, *receiver, fun
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
 	hooks := &receiver{}
 	hookSrv := httptest.NewServer(hooks)
-	cfg := config.Config{
+	cfg := config.Config{KYCStorageDir: t.TempDir(),
 		DatabaseURL: dbURL, DBMaxConns: 20, Bus: "memory",
 		AuthSigningKey: bytes.Repeat([]byte{7}, 32), APIKeyPepper: strings.Repeat("p", 32), APIKeyPepperVersion: 1,
 		BootstrapAdminEmail: "admin@paygate.test", BootstrapAdminPassword: "admin-password-123",
@@ -46,11 +46,8 @@ func startApp(t *testing.T, tweak func(*config.Config)) (*client, *receiver, fun
 		tweak(&cfg)
 	}
 	ctx := context.Background()
-	a, err := app.Build(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	a, err := buildAndStart(ctx, cfg)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
 	handler = a.Handler()
@@ -247,7 +244,7 @@ func TestOnboardingPaymentsAPIAndPayouts(t *testing.T) {
 	}
 
 	// --- Approval: live mode opens.
-	c.do("POST", "/admin/merchants/"+mid+"/status", c.admin, "", map[string]any{"status": "active"}, 200)
+	c.passKYC(owner, mid) // verification approved → merchant active
 	c.do("PATCH", "/admin/merchants/"+mid, c.admin, "", map[string]any{"fee_bps": 120}, 200)
 	c.eventually("approved merchant can create live keys", func() bool {
 		return c.status2("POST", "/v1/api-keys", owner, map[string]any{"name": "live", "environment": "live",
@@ -402,7 +399,7 @@ func TestPaymentMethodsAndHostedCheckout(t *testing.T) {
 
 	// Live: nothing is routed until a direct provider is installed.
 	mid := c.do("GET", "/v1/merchant", owner, "", nil, 200)["id"].(string)
-	c.do("POST", "/admin/merchants/"+mid+"/status", c.admin, "", map[string]any{"status": "active"}, 200)
+	c.passKYC(owner, mid) // verification approved → merchant active
 	var live string
 	c.eventually("live key after approval", func() bool {
 		r := c.raw("POST", "/v1/api-keys", owner, "", map[string]any{"name": "live", "environment": "live",
@@ -547,4 +544,34 @@ func TestAccountsAndSignIn(t *testing.T) {
 	if sent := outbox.Count("owner@pshop.test") - before; sent != 2 { // 1 earlier + 2 = 3 this hour
 		t.Fatalf("reset emails not throttled: %d sent", sent)
 	}
+}
+
+func buildAndStart(ctx context.Context, cfg config.Config) (*app.App, error) {
+	a, err := app.Build(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		return nil, err
+	}
+	if err := a.Start(ctx); err != nil {
+		a.Stop(ctx)
+		return nil, err
+	}
+	return a, nil
+}
+
+// tryStart builds and starts the app like startApp but returns the error.
+func tryStart(t *testing.T, tweak func(*config.Config)) error {
+	t.Helper()
+	resetSchemas(t, os.Getenv("TEST_DATABASE_URL"))
+	cfg := config.Config{KYCStorageDir: t.TempDir(), DatabaseURL: os.Getenv("TEST_DATABASE_URL"), DBMaxConns: 5, Bus: "memory",
+		AuthSigningKey: bytes.Repeat([]byte{7}, 32), APIKeyPepper: strings.Repeat("p", 32), APIKeyPepperVersion: 1,
+		BootstrapAdminEmail: "admin@paygate.test", BootstrapAdminPassword: "admin-password-123",
+		EncryptionKey: bytes.Repeat([]byte{1}, 32), PublicBaseURL: "http://localhost", PaymentTTL: 30 * time.Minute,
+		Mailer: &mail.Memory{}, SMS: &sms.Memory{}}
+	tweak(&cfg)
+	ctx := context.Background()
+	a, err := buildAndStart(ctx, cfg)
+	if a != nil {
+		a.Stop(ctx)
+	}
+	return err
 }

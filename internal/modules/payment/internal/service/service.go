@@ -83,6 +83,8 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (payments.Payment,
 		return payments.Payment{}, false, err
 	}
 	switch {
+	case in.Environment == "live" && !merchants.KYCPassed(m.KYCStatus):
+		return payments.Payment{}, false, merchants.ErrKYCRequired
 	case m.Status == merchants.StatusActive:
 	case m.Status == merchants.StatusPending && in.Environment == "test":
 		// Not approved yet: test mode works, live waits for approval.
@@ -282,14 +284,14 @@ func (s *Service) OnProviderTransactionUpdated(ctx context.Context, e bus.Envelo
 		if err != nil {
 			return err
 		}
-		return s.applyProviderResult(ctx, tx, p, evt.Status, evt.Amount, evt.Currency)
+		return s.applyProviderResult(ctx, tx, p, evt.Status, evt.Amount, evt.Currency, evt.FailureReason)
 	})
 }
 
 // applyProviderResult records the provider's verified answer on a locked
 // payment. Used by provider events and by the expiry worker.
-func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domain.Payment, status string, amount int64, currency string) error {
-	if p.Captured() {
+func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domain.Payment, status string, amount int64, currency, reason string) error {
+	if p.Settled() || (p.Status == domain.Failed && status != providers.StatusSucceeded) {
 		return nil
 	}
 	now := s.now()
@@ -298,10 +300,14 @@ func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domai
 		if amount != p.Amount || currency != p.Currency {
 			s.log.Error("provider amount mismatch", "payment_id", p.ID,
 				"expected", p.Amount, "got", amount, "currency", currency)
+			if p.Status == domain.Failed {
+				return nil
+			}
 			return s.failInTx(ctx, tx, p, "amount_mismatch", now)
 		}
-		if p.Status == domain.Expired {
-			s.log.Warn("payment completed after expiry; honouring it", "payment_id", p.ID)
+		if p.Status == domain.Expired || p.Status == domain.Failed {
+			s.log.Warn("payment completed after "+string(p.Status)+"; honouring the provider's capture", "payment_id", p.ID)
+			p.FailureReason = ""
 		}
 		// If the payment is still pending (checkout response not yet saved)
 		// this returns an error and the event is retried shortly.
@@ -317,7 +323,10 @@ func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domai
 			Reference: p.Reference, Metadata: p.Metadata, OccurredAt: now,
 		})
 	case providers.StatusFailed:
-		return s.failInTx(ctx, tx, p, "declined_by_provider", now)
+		if reason == "" {
+			reason = "declined_by_provider"
+		}
+		return s.failInTx(ctx, tx, p, reason, now)
 	}
 	return nil
 }
@@ -366,7 +375,7 @@ func (s *Service) ExpireDue(ctx context.Context, limit int) (int, error) {
 			}
 			if verr == nil && (remote.Status == providers.StatusSucceeded || remote.Status == providers.StatusFailed) {
 				changed++
-				return s.applyProviderResult(ctx, tx, cur, remote.Status, remote.Amount, remote.Currency)
+				return s.applyProviderResult(ctx, tx, cur, remote.Status, remote.Amount, remote.Currency, remote.FailureReason)
 			}
 			if err := cur.Expire(s.now()); err != nil {
 				return err

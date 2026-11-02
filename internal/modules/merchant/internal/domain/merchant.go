@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"paygate/internal/contracts/kyc"
 	"paygate/internal/contracts/merchants"
 	"paygate/internal/platform/apperror"
 )
@@ -19,6 +20,7 @@ type Merchant struct {
 	Website    string
 	Status     string
 	FeeBPS     int64
+	KYCStatus  string
 	ApprovedAt *time.Time
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
@@ -55,8 +57,9 @@ func NewMerchant(in NewMerchantInput, now time.Time) (*Merchant, error) {
 	}
 	switch in.Status {
 	case merchants.StatusActive:
-		m.ApprovedAt = &now
+		m.ApprovedAt, m.KYCStatus = &now, kyc.StatusNotStarted // usable at once in test mode; live mode needs KYC
 	case merchants.StatusPending:
+		m.KYCStatus = kyc.StatusNotStarted
 	default:
 		return nil, apperror.Invalid("invalid_status", "a new merchant is active or pending")
 	}
@@ -69,11 +72,35 @@ func (m *Merchant) SetStatus(status string, now time.Time) error {
 	if status != merchants.StatusActive && status != merchants.StatusSuspended {
 		return apperror.Invalid("invalid_status", "status must be active or suspended")
 	}
+	// A merchant never approved before (self-signed-up) needs approved KYC to
+	// become active, whatever its current status: suspend-then-activate must
+	// not skip verification.
+	if status == merchants.StatusActive && m.ApprovedAt == nil &&
+		m.KYCStatus != kyc.StatusApproved && m.KYCStatus != kyc.StatusWaived {
+		return ErrKYCNotApproved
+	}
 	if status == merchants.StatusActive && m.ApprovedAt == nil {
 		m.ApprovedAt = &now
 	}
 	m.Status, m.UpdatedAt = status, now
 	return nil
+}
+
+var ErrKYCNotApproved = apperror.Conflict("kyc_not_approved",
+	"this merchant's business verification (KYC) is not approved yet; approve it in /admin/kyc")
+
+// OnKYC records the verification status; approval activates a pending merchant.
+// Returns true when the merchant changed.
+func (m *Merchant) OnKYC(status string, now time.Time) bool {
+	changed := m.KYCStatus != status
+	m.KYCStatus = status
+	if status == kyc.StatusApproved && m.Status == merchants.StatusPending {
+		m.Status, m.ApprovedAt, changed = merchants.StatusActive, &now, true
+	}
+	if changed {
+		m.UpdatedAt = now
+	}
+	return changed
 }
 
 func (m *Merchant) SetFee(feeBPS int64, now time.Time) error {
