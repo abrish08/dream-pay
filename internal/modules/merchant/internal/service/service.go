@@ -56,6 +56,26 @@ func (s *Service) SetStatus(ctx context.Context, id, status string) (merchants.M
 }
 
 // SetFee changes the fee for future payments (past payments keep theirs).
+func (s *Service) SetSettings(ctx context.Context, id string, st merchants.Settings) (merchants.Merchant, error) {
+	return s.change(ctx, id, func(m *domain.Merchant) error { return m.SetSettings(st, s.now()) })
+}
+
+// PayoutSchedules answers merchants.ListPayoutSchedules: active, KYC-passed
+// merchants with daily or weekly payouts.
+func (s *Service) PayoutSchedules(ctx context.Context, _ merchants.ListPayoutSchedules) ([]merchants.PayoutSchedule, error) {
+	ms, err := s.store.WithPayoutSchedule(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []merchants.PayoutSchedule{}
+	for _, m := range ms {
+		if m.Status == merchants.StatusActive && merchants.KYCPassed(m.KYCStatus) {
+			out = append(out, merchants.PayoutSchedule{MerchantID: m.ID, Payout: m.Settings.Payout})
+		}
+	}
+	return out, nil
+}
+
 func (s *Service) SetFee(ctx context.Context, id string, feeBPS int64) (merchants.Merchant, error) {
 	return s.change(ctx, id, func(m *domain.Merchant) error { return m.SetFee(feeBPS, s.now()) })
 }
@@ -128,5 +148,16 @@ func updated(m *domain.Merchant) merchants.MerchantUpdated {
 
 func toAPI(m *domain.Merchant) merchants.Merchant {
 	return merchants.Merchant{ID: m.ID, Name: m.Name, Email: m.Email, Phone: m.Phone, Website: m.Website,
-		Status: m.Status, FeeBPS: m.FeeBPS, KYCStatus: m.KYCStatus, ApprovedAt: m.ApprovedAt, CreatedAt: m.CreatedAt}
+		Status: m.Status, FeeBPS: m.FeeBPS, KYCStatus: m.KYCStatus, Settings: withDefaults(m.Settings),
+		ApprovedAt: m.ApprovedAt, CreatedAt: m.CreatedAt}
+}
+
+func withDefaults(st merchants.Settings) merchants.Settings {
+	if st.RiskLevel == "" {
+		st.RiskLevel = merchants.RiskNormal
+	}
+	if st.Payout.Schedule == "" {
+		st.Payout.Schedule = merchants.PayoutManual
+	}
+	return st
 }

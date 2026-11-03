@@ -6,6 +6,8 @@ import "paygate/internal/contracts/auth"
 const (
 	PermRead  = "payments:read"
 	PermWrite = "payments:write"
+	// PermReadAll: platform staff look up any merchant's payment and its history.
+	PermReadAll = "payments:read_all"
 )
 
 var Permissions = []auth.PermissionDef{
@@ -13,4 +15,6 @@ var Permissions = []auth.PermissionDef{
 		DefaultRoles: []string{auth.RoleAdmin, auth.RoleDeveloper, auth.RoleAnalyst, auth.RoleViewer}},
 	{Code: PermWrite, Description: "Create payments", Audience: auth.AudienceMerchant, APIKey: true,
 		DefaultRoles: []string{auth.RoleAdmin, auth.RoleDeveloper}},
+	{Code: PermReadAll, Description: "View any merchant's payments and their history", Audience: auth.AudiencePlatform,
+		DefaultRoles: []string{auth.RoleOperations, auth.RoleFinance, auth.RoleSupport}},
 }

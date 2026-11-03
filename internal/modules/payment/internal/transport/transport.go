@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"paygate/internal/contracts/payments"
 	"paygate/internal/modules/payment/internal/service"
+	"paygate/internal/modules/payment/internal/store"
 	"paygate/internal/platform/bus"
 	"paygate/internal/platform/httpx"
 )
@@ -25,6 +27,55 @@ func (h *HTTP) RegisterPublic(r chi.Router) {
 	r.With(httpx.Require(payments.PermWrite, h.log)).Post("/payments", h.create)
 	r.With(httpx.Require(payments.PermRead, h.log)).Get("/payments", h.list)
 	r.With(httpx.Require(payments.PermRead, h.log)).Get("/payments/{id}", h.get)
+	r.With(httpx.Require(payments.PermRead, h.log)).Get("/payments/{id}/events", h.history)
+}
+
+// RegisterAdmin: platform staff (support, operations, finance) look up any
+// payment and its full history.
+//
+//	GET /admin/payments/{id}
+//	GET /admin/payments/{id}/events
+func (h *HTTP) RegisterAdmin(r chi.Router) {
+	r.Group(func(r chi.Router) {
+		r.Use(httpx.Require(payments.PermReadAll, h.log))
+		r.Get("/payments/{id}", func(w http.ResponseWriter, r *http.Request) {
+			p, err := h.svc.GetAny(r.Context(), chi.URLParam(r, "id"))
+			if err != nil {
+				httpx.WriteError(w, r, h.log, err)
+				return
+			}
+			httpx.WriteJSON(w, http.StatusOK, p)
+		})
+		r.Get("/payments/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+			h.writeHistory(w, r, "")
+		})
+	})
+}
+
+// history: GET /v1/payments/{id}/events, every status change of the payment,
+// oldest first: who caused it (source), why, and what the provider answered.
+func (h *HTTP) history(w http.ResponseWriter, r *http.Request) {
+	h.writeHistory(w, r, httpx.Principal(r).MerchantID)
+}
+
+func (h *HTTP) writeHistory(w http.ResponseWriter, r *http.Request, merchantID string) {
+	evs, err := h.svc.History(r.Context(), merchantID, chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.WriteError(w, r, h.log, err)
+		return
+	}
+	type view struct {
+		store.Event
+		Details json.RawMessage `json:"details,omitempty"`
+	}
+	out := make([]view, len(evs))
+	for i, e := range evs {
+		out[i] = view{Event: e}
+		if e.Details != "" && e.Details != "{}" {
+			out[i].Details = json.RawMessage(e.Details)
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"data": out})
 }
 
 func (h *HTTP) create(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +90,8 @@ func (h *HTTP) create(w http.ResponseWriter, r *http.Request) {
 		Customer    struct {
 			Email string `json:"email"`
 			Name  string `json:"name"`
+			Phone string `json:"phone"`
+			IP    string `json:"ip"` // the customer's IP as your server saw it (risk checks)
 		} `json:"customer"`
 		ReturnURL        string `json:"return_url"`
 		ExpiresInMinutes int    `json:"expires_in_minutes"`
@@ -53,6 +106,7 @@ func (h *HTTP) create(w http.ResponseWriter, r *http.Request) {
 		Amount: body.Amount, Currency: body.Currency, Method: body.Method, Provider: body.Provider, Reference: body.Reference,
 		Description: body.Description, Metadata: body.Metadata,
 		CustomerEmail: body.Customer.Email, CustomerName: body.Customer.Name, ReturnURL: body.ReturnURL,
+		CustomerPhone: body.Customer.Phone, CustomerIP: body.Customer.IP,
 		ExpiresInMin: body.ExpiresInMinutes,
 	})
 	if err != nil {
@@ -114,4 +168,6 @@ func RegisterBus(b bus.Bus, svc *service.Service) {
 		return svc.Get(ctx, q.MerchantID, q.PaymentID)
 	})
 	bus.Handle(b, svc.List)
+	bus.Handle(b, svc.GetByIDs)
+	bus.Handle(b, svc.Sync)
 }

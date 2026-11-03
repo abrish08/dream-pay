@@ -20,6 +20,7 @@ import (
 	"paygate/internal/platform/bus"
 	"paygate/internal/platform/database"
 	"paygate/internal/platform/events"
+	"paygate/internal/platform/metrics"
 )
 
 // Routers are the HTTP entry points a module can attach to.
@@ -114,6 +115,14 @@ func (b *Base) Start(ctx context.Context) error {
 		b.Log.Warn("start task failed, retrying in background", "task", t.name, "err", err)
 		workers = append(workers, b.retry(t))
 	}
+	db := b.DB
+	metrics.Gauge("paygate_outbox_pending", "Events written but not yet published to the bus", map[string]string{"module": b.name},
+		func(ctx context.Context) ([]metrics.Sample, error) {
+			var n, oldest float64
+			err := db.WithContext(ctx).Raw(`SELECT COUNT(*), COALESCE(EXTRACT(EPOCH FROM now() - MIN(created_at)), 0)
+				FROM outbox WHERE published_at IS NULL`).Row().Scan(&n, &oldest)
+			return []metrics.Sample{{Labels: map[string]string{"stat": "count"}, Value: n}, {Labels: map[string]string{"stat": "oldest_seconds"}, Value: oldest}}, err
+		})
 	relay := events.NewRelay(b.DB, b.Bus, b.name, b.Log)
 	for _, fn := range append([]func(context.Context){relay.Run}, workers...) {
 		b.wg.Add(1)

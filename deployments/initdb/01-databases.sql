@@ -9,3 +9,5 @@ CREATE DATABASE gw_webhook;
 CREATE DATABASE gw_reconciliation;
 CREATE DATABASE gw_payout;
 CREATE DATABASE gw_kyc;
+CREATE DATABASE gw_risk;
+CREATE DATABASE gw_dispute;

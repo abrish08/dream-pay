@@ -43,7 +43,7 @@ type Deps struct {
 	MPGS, MPGSTest *MPGSConfig
 }
 
-// MPGSConfig: credentials from the acquiring bank (see README "Card payments").
+// MPGSConfig: credentials from the acquiring bank (see docs/providers.md).
 type MPGSConfig struct {
 	BaseURL, MerchantID, APIPassword, APIVersion, MerchantName, NotificationSecret string
 	Currencies                                                                     []string

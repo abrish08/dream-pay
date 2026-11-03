@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/google/uuid"
@@ -56,9 +57,13 @@ func (s *Store) GetForUpdate(ctx context.Context, id string) (*domain.Merchant, 
 }
 
 func (s *Store) Save(ctx context.Context, m *domain.Merchant) error {
+	settings, err := json.Marshal(m.Settings)
+	if err != nil {
+		return err
+	}
 	return s.db.WithContext(ctx).Table(table).Where("id = ?", m.ID).
 		Updates(map[string]any{"status": m.Status, "fee_bps": m.FeeBPS, "approved_at": m.ApprovedAt,
-			"kyc_status": m.KYCStatus, "updated_at": m.UpdatedAt}).Error
+			"kyc_status": m.KYCStatus, "settings": string(settings), "updated_at": m.UpdatedAt}).Error
 }
 
 // List: newest first, optional status, cursor (created_at, id).
@@ -82,4 +87,12 @@ func (s *Store) List(ctx context.Context, status, startingAfter string, limit in
 		out = out[:limit]
 	}
 	return out, more, nil
+}
+
+// WithPayoutSchedule: merchants whose settings ask for automatic payouts.
+func (s *Store) WithPayoutSchedule(ctx context.Context) ([]domain.Merchant, error) {
+	var out []domain.Merchant
+	err := s.db.WithContext(ctx).Table(table).
+		Where("settings->'payout'->>'schedule' IN ?", []string{merchants.PayoutDaily, merchants.PayoutWeekly}).Find(&out).Error
+	return out, err
 }

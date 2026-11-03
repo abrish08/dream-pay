@@ -5,6 +5,7 @@ package domain
 import (
 	"fmt"
 	"net/mail"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -65,14 +66,64 @@ type Payment struct {
 	Metadata       database.StringMap `gorm:"type:jsonb"`
 	CustomerEmail  string
 	CustomerName   string
+	CustomerPhone  string
+	CustomerIP     string
 	ReturnURL      string
 	CheckoutURL    string
 	FailureReason  string
+	Reserve        int64 // held from the merchant's share for ReserveDays (refund / chargeback cover)
+	ReserveDays    int
 	IdempotencyKey string
 	RequestHash    string
 	ExpiresAt      time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	NextCheckAt    *time.Time // next status check with the provider (open payments only)
+	CheckCount     int
+
+	changes []Change `gorm:"-"` // recorded in payment_events when saved
+}
+
+// ---- History ----
+
+// Sources of a change, recorded in the payment's history.
+const (
+	SourceMerchantAPI    = "merchant_api"   // the merchant's server (API key)
+	SourceCustomer       = "customer"       // the customer on the hosted page
+	SourceProvider       = "provider"       // the provider's notification (verified with the provider)
+	SourceStatusCheck    = "status_check"   // our scheduled check with the provider
+	SourceExpiry         = "expiry"         // the payment's time ran out
+	SourceRefund         = "refund"         // a refund was paid back
+	SourceReconciliation = "reconciliation" // the daily reconciliation found a difference
+	SourceRisk           = "risk"           // declined by the fraud rules
+	SourceDispute        = "dispute"        // a chargeback was opened or decided
+	SourceSystem         = "system"
+)
+
+// Change is one entry of the payment's history.
+type Change struct {
+	From, To Status
+	Note     string // for a note without status change (From == To)
+	At       time.Time
+}
+
+// Actor says who caused the changes being saved and why.
+type Actor struct {
+	Source   string
+	Reason   string
+	Provider string
+	Details  map[string]any // e.g. what the provider answered
+}
+
+// Changes returns the changes not yet saved.
+func (p *Payment) Changes() []Change { return p.changes }
+
+// ClearChanges is called once they are saved.
+func (p *Payment) ClearChanges() { p.changes = nil }
+
+// Note records an event without a status change (e.g. "method chosen").
+func (p *Payment) Note(note string, now time.Time) {
+	p.changes = append(p.changes, Change{From: p.Status, To: p.Status, Note: note, At: now})
 }
 
 type NewPaymentInput struct {
@@ -89,8 +140,12 @@ type NewPaymentInput struct {
 	Metadata       map[string]string
 	CustomerEmail  string
 	CustomerName   string
+	CustomerPhone  string
+	CustomerIP     string
 	ReturnURL      string
 	TTL            time.Duration // how long the customer has to pay
+	ReserveBPS     int64         // the merchant's reserve rate now (snapshot)
+	ReserveDays    int
 }
 
 const (
@@ -118,6 +173,14 @@ func NewPayment(in NewPaymentInput, feeBPS int64, now time.Time) (*Payment, erro
 			return nil, apperror.Invalid("invalid_customer_email", "customer email is not valid")
 		}
 	}
+	if len(in.CustomerPhone) > 20 {
+		return nil, apperror.Invalid("invalid_customer_phone", "customer phone is too long")
+	}
+	if in.CustomerIP != "" {
+		if _, err := netip.ParseAddr(in.CustomerIP); err != nil {
+			return nil, apperror.Invalid("invalid_customer_ip", "customer ip must be an IPv4 or IPv6 address")
+		}
+	}
 	if len(in.Description) > 255 {
 		return nil, apperror.Invalid("invalid_description", "description is at most 255 characters")
 	}
@@ -135,9 +198,17 @@ func NewPayment(in NewPaymentInput, feeBPS int64, now time.Time) (*Payment, erro
 	if in.TTL < MinTTL || in.TTL > MaxTTL {
 		return nil, apperror.Invalid("invalid_expiry", "expires_in_minutes must be between 5 and 1440")
 	}
+	fee := CalculateFee(in.Amount, feeBPS)
+	reserve := int64(0)
+	if in.ReserveBPS > 0 && in.ReserveDays > 0 {
+		reserve = CalculateFee(in.Amount-fee, in.ReserveBPS) // of the merchant's share
+	}
 	return &Payment{
-		ID: uuid.NewString(), MerchantID: in.MerchantID, Environment: in.Environment,
-		Amount: in.Amount, Fee: CalculateFee(in.Amount, feeBPS), Currency: in.Currency,
+		Reserve: reserve, ReserveDays: in.ReserveDays,
+		CustomerPhone: strings.TrimSpace(in.CustomerPhone), CustomerIP: strings.TrimSpace(in.CustomerIP),
+		changes: []Change{{From: "", To: Pending, At: now}},
+		ID:      uuid.NewString(), MerchantID: in.MerchantID, Environment: in.Environment,
+		Amount: in.Amount, Fee: fee, Currency: in.Currency,
 		Status: Pending, PaymentMethod: in.Method, Provider: in.Provider, Reference: strings.TrimSpace(in.Reference),
 		Description: strings.TrimSpace(in.Description), Metadata: in.Metadata,
 		CustomerEmail: in.CustomerEmail, CustomerName: in.CustomerName, ReturnURL: in.ReturnURL,
@@ -154,17 +225,38 @@ func (p *Payment) TransitionTo(next Status, now time.Time) error {
 	if !slices.Contains(transitions[p.Status], next) {
 		return ErrInvalidTransition.WithMessage(fmt.Sprintf("cannot move payment from %s to %s", p.Status, next))
 	}
+	p.changes = append(p.changes, Change{From: p.Status, To: next, At: now})
 	p.Status, p.UpdatedAt = next, now
+	if next != Processing {
+		p.NextCheckAt = nil // only open payments are checked
+	}
 	return nil
 }
 
-// StartProcessing records where the checkout was routed.
-func (p *Payment) StartProcessing(provider, providerRef, checkoutURL string, now time.Time) error {
+// StartProcessing records where the checkout was routed and schedules the
+// first status check with the provider.
+func (p *Payment) StartProcessing(provider, providerRef, checkoutURL string, firstCheck time.Duration, now time.Time) error {
 	if err := p.TransitionTo(Processing, now); err != nil {
 		return err
 	}
 	p.Provider, p.ProviderRef, p.CheckoutURL = provider, providerRef, checkoutURL
+	if firstCheck > 0 {
+		at := now.Add(firstCheck)
+		p.NextCheckAt, p.CheckCount = &at, 0
+	}
 	return nil
+}
+
+// ScheduleCheck sets the next status check after a check that found the
+// payment still open; nil when the schedule is used up (expiry takes over).
+func (p *Payment) ScheduleCheck(schedule []time.Duration, now time.Time) {
+	p.CheckCount++
+	if p.Status != Processing || p.CheckCount >= len(schedule) {
+		p.NextCheckAt = nil
+		return
+	}
+	at := now.Add(schedule[p.CheckCount])
+	p.NextCheckAt = &at
 }
 
 // ChooseMethod: the customer picked a method on the hosted checkout page.

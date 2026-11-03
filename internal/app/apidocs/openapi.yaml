@@ -26,6 +26,8 @@ tags:
   - {name: KYC, description: "Business verification: required before live payments"}
   - {name: Admin - merchants & users}
   - {name: Admin - KYC}
+  - {name: Disputes, description: "Chargebacks: respond with evidence before the deadline"}
+  - {name: Admin - risk & disputes}
   - {name: Admin - roles}
   - {name: Admin - money}
   - {name: Hosted pages & providers, description: Called by customers' browsers and by payment providers}
@@ -386,6 +388,19 @@ paths:
       responses:
         "200": {description: Payment, content: {application/json: {schema: {$ref: "#/components/schemas/Payment"}}}}
         "404": {$ref: "#/components/responses/Error"}
+  /v1/payments/{id}/events:
+    get:
+      tags: [Payments]
+      summary: The payment's history, oldest first (payments:read)
+      description: |
+        Every status change, written in the same transaction as the change and never rewritten
+        (the database refuses edits). `source` says who caused it: `merchant_api`, `customer`,
+        `provider` (notification, verified with the provider), `status_check` (our scheduled check),
+        `expiry`, `refund`, `reconciliation`. `details` keeps what the provider answered.
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {$ref: "#/components/responses/PaymentEvents"}
+        "404": {$ref: "#/components/responses/Error"}
 
   # ---------------- Refunds ----------------
   /v1/refunds:
@@ -446,7 +461,53 @@ paths:
                   currency: {type: string}
                   environment: {type: string}
                   available: {type: integer, format: int64, description: Can be paid out}
+                  reserved: {type: integer, format: int64, description: Rolling reserve; each part becomes available after reserve_days}
+                  dispute_hold: {type: integer, format: int64, description: Held for open disputes}
                   pending_payouts: {type: integer, format: int64, description: Held for payouts not sent yet}
+  /v1/disputes:
+    get:
+      tags: [Disputes]
+      summary: Your disputes (chargebacks), e.g. ?status=needs_response (disputes:read)
+      parameters: [{name: status, in: query, schema: {type: string, enum: [needs_response, under_review, won, lost]}}, {$ref: "#/components/parameters/Limit"}]
+      responses: {"200": {description: Disputes}}
+  /v1/disputes/{id}:
+    get:
+      tags: [Disputes]
+      summary: A dispute, its evidence and history (disputes:read)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {description: Dispute, content: {application/json: {schema: {$ref: "#/components/schemas/Dispute"}}}}, "404": {$ref: "#/components/responses/Error"}}
+  /v1/disputes/{id}/evidence:
+    post:
+      tags: [Disputes]
+      summary: Add evidence before the deadline (disputes:write)
+      description: Text and up to 5 files (PDF, JPEG, PNG; 5 MB each), e.g. delivery proof, receipt, chat with the customer. Can be repeated until you submit.
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            example: {"text": "Delivered on 2 Nov, signed by the customer."}
+            schema: {type: object, properties: {text: {type: string}, files: {type: array, items: {type: string, format: binary}}}}
+      responses: {"200": {description: Updated}, "400": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}}
+  /v1/disputes/{id}/submit:
+    post:
+      tags: [Disputes]
+      summary: Send your evidence for review (disputes:write)
+      description: Without evidence by `evidence_due_by` the dispute is lost automatically.
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {description: Under review}, "400": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}}
+  /v1/disputes/{id}/accept:
+    post:
+      tags: [Disputes]
+      summary: Do not contest; the disputed amount goes back to the cardholder (disputes:write)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {description: Lost}, "409": {$ref: "#/components/responses/Error"}}
+  /v1/disputes/{id}/files/{fileId}:
+    get:
+      tags: [Disputes]
+      summary: Download one of your evidence files (disputes:read)
+      parameters: [{$ref: "#/components/parameters/Id"}, {name: fileId, in: path, required: true, schema: {type: string}}]
+      responses: {"200": {description: The file}, "404": {$ref: "#/components/responses/Error"}}
   /v1/payouts:
     post:
       tags: [Balance & payouts]
@@ -817,10 +878,22 @@ paths:
       responses: {"200": {description: Merchant, content: {application/json: {schema: {$ref: "#/components/schemas/Merchant"}}}}}
     patch:
       tags: [Admin - merchants & users]
-      summary: Change the fee for future payments (merchants:manage)
+      summary: Change the fee and the settings (limits, risk level, reserve, payout schedule) for future payments (merchants:manage)
+      description: |
+        `settings` replaces the whole settings object. Limits are per currency (minor units, 0 = none) and are
+        enforced when a payment is created (`422 limit_exceeded`). The reserve is a share of the merchant's part
+        of each payment held for `reserve_days`. A daily or weekly payout schedule needs the bank account you
+        verified (KYC bank_account_proof).
       parameters: [{$ref: "#/components/parameters/Id"}]
       requestBody:
-        content: {application/json: {example: {"fee_bps": 120}, schema: {type: object, properties: {fee_bps: {type: integer, minimum: 0, maximum: 10000}}}}}
+        content:
+          application/json:
+            example: {"fee_bps": 120, "settings": {"risk_level": "normal", "limits": {"ETB": {"max_amount": 5000000, "daily_amount": 50000000, "daily_count": 2000}}, "reserve_bps": 500, "reserve_days": 14, "payout": {"schedule": "weekly", "weekday": 1, "currencies": ["ETB"], "min_amount": 100000, "bank": {"bank_name": "Commercial Bank of Ethiopia", "account_number": "1000123456789", "account_name": "Abebe Coffee PLC"}}}}
+            schema:
+              type: object
+              properties:
+                fee_bps: {type: integer, minimum: 0, maximum: 10000}
+                settings: {$ref: "#/components/schemas/MerchantSettings"}
       responses: {"200": {description: Merchant, content: {application/json: {schema: {$ref: "#/components/schemas/Merchant"}}}}}
   /admin/merchants/{id}/status:
     post:
@@ -990,6 +1063,14 @@ paths:
               properties:
                 from: {type: string, format: date-time}
                 to: {type: string, format: date-time}
+                provider: {type: string, description: Only payments routed to this provider}
+      description: |
+        Checks every payment created in the period three ways: against the provider's live API
+        (status and amount), against the ledger (every capture booked once, for its amount), and for
+        payments stuck in `processing`. A run also starts automatically every day for the previous
+        business day (RECONCILIATION_TIMEZONE, default Africa/Addis_Ababa). When the provider says the
+        customer was charged but the payment is not succeeded, the payment is repaired automatically
+        (recorded in its history); everything else becomes an open item.
       responses: {"202": {$ref: "#/components/responses/ReconciliationRun"}}
     get:
       tags: [Admin - money]
@@ -999,9 +1080,192 @@ paths:
   /admin/reconciliation/runs/{id}:
     get:
       tags: [Admin - money]
-      summary: A run and its mismatches (reconciliation:run)
+      summary: A run, its summary and the differences found (reconciliation:run)
       parameters: [{$ref: "#/components/parameters/Id"}]
       responses: {"200": {$ref: "#/components/responses/ReconciliationRun"}}
+  /admin/reconciliation/items:
+    get:
+      tags: [Admin - money]
+      summary: "The work queue: differences, e.g. ?status=open&severity=critical (reconciliation:run)"
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [open, auto_resolved, resolved, all], default: open}}
+        - {name: severity, in: query, schema: {type: string, enum: [critical, high, medium, low]}}
+        - {name: issue, in: query, schema: {type: string}}
+        - {$ref: "#/components/parameters/Limit"}
+      responses:
+        "200":
+          description: Items, newest first
+          content: {application/json: {schema: {type: object, properties: {data: {type: array, items: {$ref: "#/components/schemas/ReconciliationItem"}}}}}}
+  /admin/reconciliation/items/{id}/resolve:
+    post:
+      tags: [Admin - money]
+      summary: Close a difference after investigating it (reconciliation:resolve, finance)
+      parameters: [{name: id, in: path, required: true, schema: {type: integer}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"note": "provider confirmed a partial capture; adjustment raised"}
+            schema: {type: object, required: [note], properties: {note: {type: string, minLength: 5}}}
+      responses:
+        "200": {description: Resolved, content: {application/json: {schema: {$ref: "#/components/schemas/ReconciliationItem"}}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+  /admin/reconciliation/settlements:
+    post:
+      tags: [Admin - money]
+      summary: Upload a provider's settlement report for a business day (reconciliation:run)
+      description: |
+        CSV with a header row. Required columns: `reference` (our payment id, the order id sent to the
+        provider), `amount` (major units, `50.00`), `currency`. Optional: `type` (`payment` or `refund`),
+        `fee`, `settled_at`. Every bad line is reported with its number and nothing is imported. The same
+        file cannot be uploaded twice. Matching finds: wrong amounts, payments the provider settled that we
+        did not capture (repaired automatically when the provider confirms), captured payments not
+        settled yet (closed automatically when a later report contains them), duplicates, and a bank
+        deposit (`deposit_amount`) that differs from the report's net.
+      parameters:
+        - {name: provider, in: query, required: true, schema: {type: string, example: mpgs}}
+        - {name: date, in: query, required: true, schema: {type: string, format: date}}
+        - {name: deposit_amount, in: query, schema: {type: string, example: "12345.67"}, description: What the bank paid in for this report}
+        - {name: deposit_currency, in: query, schema: {type: string, example: ETB}}
+        - {name: file_name, in: query, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            example: "reference,type,amount,fee,currency,settled_at\n7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c,payment,1500.00,22.50,ETB,2026-10-28\n"
+            schema: {type: string}
+      responses:
+        "202":
+          description: Stored; matching runs now (see the run)
+          content: {application/json: {schema: {type: object, properties: {settlement: {$ref: "#/components/schemas/Settlement"}, run: {type: object}}}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "413": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [Admin - money]
+      summary: Uploaded settlement reports, newest first (reconciliation:run)
+      parameters: [{$ref: "#/components/parameters/Limit"}]
+      responses: {"200": {description: Settlements, content: {application/json: {schema: {type: object, properties: {data: {type: array, items: {$ref: "#/components/schemas/Settlement"}}}}}}}}
+  /admin/reconciliation/settlements/{id}:
+    get:
+      tags: [Admin - money]
+      summary: One settlement report (reconciliation:run)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {description: Settlement, content: {application/json: {schema: {$ref: "#/components/schemas/Settlement"}}}}
+        "404": {$ref: "#/components/responses/Error"}
+  /admin/risk/blocklist:
+    get:
+      tags: [Admin - risk & disputes]
+      summary: Blocklist, e.g. ?kind=email (risk:read)
+      parameters:
+        - {name: kind, in: query, schema: {type: string, enum: [email, phone, ip]}}
+        - {$ref: "#/components/parameters/Limit"}
+      responses: {"200": {description: Entries}}
+    post:
+      tags: [Admin - risk & disputes]
+      summary: Block an email, phone or IP from paying (risk:manage)
+      description: Values are normalised (lower-case email, +251 phone, canonical IP). Payments from a blocked customer fail with `422 risk_declined`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"kind": "email", "value": "fraud@example.com", "reason": "3 chargebacks in October"}
+            schema: {type: object, required: [kind, value, reason], properties: {kind: {type: string, enum: [email, phone, ip]}, value: {type: string}, reason: {type: string}}}
+      responses: {"201": {description: Blocked}, "400": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}}
+  /admin/risk/blocklist/{id}:
+    delete:
+      tags: [Admin - risk & disputes]
+      summary: Remove a blocklist entry (risk:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"204": {description: Removed}, "404": {$ref: "#/components/responses/Error"}}
+  /admin/risk/decisions:
+    get:
+      tags: [Admin - risk & disputes]
+      summary: Risk decisions, newest first (risk:read)
+      description: |
+        Every payment is scored before it reaches a provider. Rules: blocklist (100), 5+ attempts by one customer
+        in 10 minutes or 20+ in a day (100), 10+ from one IP in 10 minutes (100), 3+ declines of one customer in an hour
+        (60; 5+ = 100, card testing), an amount over 10x the merchant's 30-day average (40), high-risk merchant (20).
+        100 blocks. High-risk merchants get half the thresholds.
+      parameters:
+        - {name: merchant_id, in: query, schema: {type: string}}
+        - {name: payment_id, in: query, schema: {type: string}}
+        - {name: action, in: query, schema: {type: string, enum: [allow, block]}}
+        - {$ref: "#/components/parameters/Limit"}
+      responses: {"200": {description: Decisions}}
+  /admin/disputes:
+    post:
+      tags: [Admin - risk & disputes]
+      summary: Record a dispute (chargeback) the provider notified (disputes:manage)
+      description: The amount (default all that is left of the payment) leaves the merchant's balance at once and is held. The merchant gets a `dispute.opened` webhook.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"payment_id": "7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c", "amount": 20000, "reason_code": "product_not_received", "reason": "cardholder says the order never arrived", "provider_case_id": "CB-1001", "evidence_due_by": "2026-11-10T00:00:00Z"}
+            schema:
+              type: object
+              required: [payment_id, reason_code]
+              properties:
+                payment_id: {type: string}
+                amount: {type: integer}
+                reason_code: {type: string, enum: [fraudulent, product_not_received, product_unacceptable, duplicate, credit_not_processed, subscription_canceled, general]}
+                reason: {type: string}
+                provider_case_id: {type: string}
+                evidence_due_by: {type: string, format: date-time, description: Default 7 days}
+      responses:
+        "201": {description: Opened, content: {application/json: {schema: {$ref: "#/components/schemas/Dispute"}}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [Admin - risk & disputes]
+      summary: All disputes, e.g. ?status=under_review (disputes:manage)
+      parameters: [{name: status, in: query, schema: {type: string}}, {$ref: "#/components/parameters/Limit"}]
+      responses: {"200": {description: Disputes}}
+  /admin/disputes/{id}:
+    get:
+      tags: [Admin - risk & disputes]
+      summary: A dispute with its evidence and history (disputes:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses: {"200": {description: Dispute, content: {application/json: {schema: {$ref: "#/components/schemas/Dispute"}}}}, "404": {$ref: "#/components/responses/Error"}}
+  /admin/disputes/{id}/files/{fileId}:
+    get:
+      tags: [Admin - risk & disputes]
+      summary: Download an evidence file (disputes:manage)
+      parameters: [{$ref: "#/components/parameters/Id"}, {name: fileId, in: path, required: true, schema: {type: string}}]
+      responses: {"200": {description: The file}, "404": {$ref: "#/components/responses/Error"}}
+  /admin/disputes/{id}/close:
+    post:
+      tags: [Admin - risk & disputes]
+      summary: Record the issuer's decision (disputes:manage)
+      description: "`won`: the held money goes back to the merchant. `lost`: it goes back to the cardholder and `fee` (the provider's chargeback fee) is charged to the merchant."
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"outcome": "won", "note": "issuer accepted the delivery proof"}
+            schema: {type: object, required: [outcome], properties: {outcome: {type: string, enum: [won, lost]}, fee: {type: integer}, note: {type: string}}}
+      responses: {"200": {description: Closed, content: {application/json: {schema: {$ref: "#/components/schemas/Dispute"}}}}, "400": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}}
+  /admin/payments/{id}:
+    get:
+      tags: [Admin - money]
+      summary: Any merchant's payment (payments:read_all)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {description: Payment, content: {application/json: {schema: {$ref: "#/components/schemas/Payment"}}}}
+        "404": {$ref: "#/components/responses/Error"}
+  /admin/payments/{id}/events:
+    get:
+      tags: [Admin - money]
+      summary: Any payment's full history (payments:read_all)
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200": {$ref: "#/components/responses/PaymentEvents"}
+        "404": {$ref: "#/components/responses/Error"}
   /admin/providers:
     get:
       tags: [Admin - money]
@@ -1145,6 +1409,17 @@ paths:
       summary: Redirects to the API documentation (/docs)
       security: []
       responses: {"302": {description: Redirect to /docs}}
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics (with METRICS_TOKEN set, send it as a Bearer token)
+      description: |
+        Traffic (`paygate_http_requests_total`, latency histogram by route), payments (created, final status and
+        reason, open and stuck), provider calls (outcome ok / unavailable / unknown / error, latency), risk outcomes,
+        outbox backlog per module, webhook deliveries waiting or failed, open reconciliation items by severity, open
+        disputes, and `paygate_ledger_unbalanced` (1 = the books do not balance: page someone).
+      security: []
+      responses: {"200": {description: Metrics in the Prometheus text format, content: {text/plain: {}}}, "401": {description: Missing or wrong token}}
   /healthz:
     get:
       tags: [System]
@@ -1264,14 +1539,109 @@ components:
             type: object
             properties:
               id: {type: string}
-              kind: {type: string}
+              kind: {type: string, enum: [manual, daily, settlement]}
+              provider: {type: string}
+              settlement_id: {type: string}
               period_start: {type: string, format: date-time}
               period_end: {type: string, format: date-time}
-              status: {type: string, enum: [pending, running, completed, failed]}
+              status: {type: string, enum: [queued, running, completed, failed]}
               checked: {type: integer}
               mismatched: {type: integer}
-              items: {type: array, items: {type: object}}
+              summary:
+                type: object
+                description: "Totals per currency (captured / settled: count, amount, fees, refunded, net), new issues by type, critical count, auto_resolved, carried_over_closed, deposit check"
+              items: {type: array, items: {$ref: "#/components/schemas/ReconciliationItem"}}
+          example: {"id": "3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f", "kind": "daily", "period_start": "2026-10-27T21:00:00Z", "period_end": "2026-10-28T21:00:00Z", "status": "completed", "checked": 1250, "mismatched": 2, "summary": {"by_status": {"succeeded": 1180, "failed": 52, "expired": 18}, "captured": {"ETB": {"count": 1180, "amount": 98500000, "fees": 1477500, "refunded": 120000, "net": 96902500}}, "issues": {"status_mismatch": 1, "ledger_missing": 1}, "critical": 1, "auto_resolved": 1, "carried_over_closed": 0}, "items": [{"id": 41, "run_id": "3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f", "payment_id": "7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c", "reference": "7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c", "provider": "telebirr", "issue": "status_mismatch", "severity": "critical", "expected": "failed", "actual": "succeeded", "status": "auto_resolved", "resolution": "repaired: the provider confirmed the capture and the payment is now succeeded", "resolved_by": "reconciliation", "created_at": "2026-10-29T01:00:02Z"}]}
+    PaymentEvents:
+      description: History, oldest first
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: {type: integer}
+                    from_status: {type: string}
+                    to_status: {type: string}
+                    source: {type: string, enum: [merchant_api, customer, provider, status_check, expiry, refund, reconciliation, system, migration]}
+                    reason: {type: string}
+                    provider: {type: string}
+                    details: {type: object}
+                    created_at: {type: string, format: date-time}
+          example: {"data": [{"id": 1, "from_status": "", "to_status": "pending", "source": "merchant_api", "created_at": "2026-10-28T09:30:00Z"}, {"id": 2, "from_status": "pending", "to_status": "processing", "source": "merchant_api", "reason": "checkout opened", "provider": "telebirr", "created_at": "2026-10-28T09:30:01Z"}, {"id": 3, "from_status": "processing", "to_status": "succeeded", "source": "provider", "provider": "telebirr", "details": {"provider_status": "succeeded", "amount": 150000, "currency": "ETB"}, "created_at": "2026-10-28T09:31:12Z"}]}
   schemas:
+    MerchantSettings:
+      type: object
+      properties:
+        risk_level: {type: string, enum: [low, normal, high], default: normal}
+        limits:
+          type: object
+          description: Per currency (ETB, USD), minor units; 0 or missing = no limit
+          additionalProperties:
+            type: object
+            properties: {max_amount: {type: integer}, daily_amount: {type: integer}, daily_count: {type: integer}}
+        reserve_bps: {type: integer, minimum: 0, maximum: 5000, description: "Share of the merchant's part held, 1000 = 10%"}
+        reserve_days: {type: integer, minimum: 0, maximum: 180}
+        payout:
+          type: object
+          properties:
+            schedule: {type: string, enum: [manual, daily, weekly], default: manual}
+            weekday: {type: integer, minimum: 1, maximum: 7, description: "weekly: 1 = Monday"}
+            currencies: {type: array, items: {type: string}, default: [ETB]}
+            min_amount: {type: integer}
+            bank: {type: object, properties: {bank_name: {type: string}, account_number: {type: string}, account_name: {type: string}}}
+    Dispute:
+      type: object
+      properties:
+        id: {type: string}
+        payment_id: {type: string}
+        amount: {type: integer}
+        currency: {type: string}
+        status: {type: string, enum: [needs_response, under_review, won, lost]}
+        reason_code: {type: string}
+        reason: {type: string}
+        provider_case_id: {type: string}
+        evidence_due_by: {type: string, format: date-time}
+        evidence_text: {type: string}
+        files: {type: array, items: {type: object, properties: {id: {type: string}, name: {type: string}, content_type: {type: string}, size: {type: integer}, sha256: {type: string}}}}
+        outcome: {type: string, enum: [won, lost]}
+        fee: {type: integer}
+        history: {type: array, items: {type: object, properties: {action: {type: string}, actor: {type: string}, note: {type: string}, created_at: {type: string, format: date-time}}}}
+      example: {"id": "1d2e3f4a-5b6c-4d7e-8f9a-0b1c2d3e4f5a", "payment_id": "7b9e2c1a-3f4d-4e8a-9b6c-1d2e3f4a5b6c", "amount": 20000, "currency": "USD", "status": "needs_response", "reason_code": "product_not_received", "evidence_due_by": "2026-11-10T00:00:00Z", "files": []}
+    ReconciliationItem:
+      type: object
+      properties:
+        id: {type: integer}
+        run_id: {type: string}
+        payment_id: {type: string}
+        reference: {type: string}
+        provider: {type: string}
+        issue: {type: string, enum: [status_mismatch, amount_mismatch, missing_at_provider, provider_error, stuck_processing, ledger_missing, ledger_amount_mismatch, settlement_missing, settlement_unknown, settlement_amount_mismatch, settlement_duplicate, deposit_mismatch]}
+        severity: {type: string, enum: [critical, high, medium, low]}
+        expected: {type: string}
+        actual: {type: string}
+        status: {type: string, enum: [open, auto_resolved, resolved]}
+        resolution: {type: string}
+        resolved_by: {type: string}
+        resolved_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    Settlement:
+      type: object
+      properties:
+        id: {type: string}
+        provider: {type: string}
+        settlement_date: {type: string, format: date}
+        file_name: {type: string}
+        sha256: {type: string}
+        line_count: {type: integer}
+        deposit_amount: {type: integer}
+        deposit_currency: {type: string}
+        uploaded_by: {type: string}
+        created_at: {type: string, format: date-time}
     Error:
       type: object
       example: {"error": {"kind": "invalid", "code": "invalid_amount", "message": "amount must be a positive integer in minor units"}}
@@ -1385,9 +1755,12 @@ components:
           example: {order_id: "A-1001"}
         customer:
           type: object
+          description: Used by the risk checks (blocklist, velocity per customer and IP); send what you have
           properties:
             email: {type: string}
             name: {type: string}
+            phone: {type: string, example: "+251911234567"}
+            ip: {type: string, description: "The customer's IP as your server saw it", example: "196.188.10.20"}
         return_url: {type: string, description: Where the customer goes after paying}
         expires_in_minutes: {type: integer, minimum: 5, maximum: 1440, default: 30}
     Payment:

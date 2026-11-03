@@ -6,21 +6,26 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"gorm.io/gorm"
 
+	"paygate/internal/contracts/disputes"
 	"paygate/internal/contracts/merchants"
 	"paygate/internal/contracts/payments"
 	"paygate/internal/contracts/providers"
 	"paygate/internal/contracts/refunds"
+	"paygate/internal/contracts/risk"
 	"paygate/internal/modules/payment/internal/domain"
 	"paygate/internal/modules/payment/internal/store"
 	"paygate/internal/platform/apperror"
 	"paygate/internal/platform/bus"
 	"paygate/internal/platform/events"
+	"paygate/internal/platform/metrics"
+	"paygate/internal/platform/money"
 )
 
 type Service struct {
@@ -33,17 +38,62 @@ type Service struct {
 	ttl        time.Duration // default time a customer has to pay
 	// ExpiryEvery: how often the expiry worker runs (default 15s).
 	ExpiryEvery time.Duration
-	log         *slog.Logger
-	now         func() time.Time
+	// CheckEvery: how often due status checks are run (default 5s).
+	CheckEvery time.Duration
+	// CheckSchedule: when open payments are checked with the provider, as
+	// delays from the previous check (the first from when the checkout opened).
+	CheckSchedule []time.Duration
+	log           *slog.Logger
+	now           func() time.Time
 }
 
+var (
+	paymentsCreated = metrics.Counter("paygate_payments_created_total", "Payments created", "environment", "method", "currency")
+	paymentsFinal   = metrics.Counter("paygate_payments_final_total", "Payments reaching a final status", "environment", "status", "provider", "reason")
+	riskOutcomes    = metrics.Counter("paygate_payment_risk_total", "Risk and limit outcomes at creation", "outcome")
+)
+
 func New(db *gorm.DB, pub events.Publisher, b bus.Bus, allowMockInLive bool, ttl time.Duration, publicBase string, log *slog.Logger) *Service {
+	metrics.Gauge("paygate_payments_open", "Open payments by status; stuck = processing for over 15 minutes", nil,
+		func(ctx context.Context) ([]metrics.Sample, error) {
+			var rows []struct {
+				Environment string
+				Status      string
+				N           float64
+				Stuck       float64
+			}
+			err := db.WithContext(ctx).Raw(`SELECT environment, status, COUNT(*) AS n,
+				COUNT(*) FILTER (WHERE status = 'processing' AND created_at < now() - interval '15 minutes') AS stuck
+				FROM payments WHERE status IN ('pending', 'processing') GROUP BY environment, status`).Scan(&rows).Error
+			var out []metrics.Sample
+			for _, r := range rows {
+				out = append(out, metrics.Sample{Labels: map[string]string{"environment": r.Environment, "status": r.Status}, Value: r.N})
+				if r.Status == "processing" {
+					out = append(out, metrics.Sample{Labels: map[string]string{"environment": r.Environment, "status": "stuck"}, Value: r.Stuck})
+				}
+			}
+			return out, err
+		})
 	if ttl == 0 {
 		ttl = 30 * time.Minute
 	}
 	return &Service{db: db, store: store.New(db), events: pub, bus: b, allowMock: allowMockInLive, ttl: ttl,
-		publicBase: strings.TrimRight(publicBase, "/"),
-		log:        log, now: func() time.Time { return time.Now().UTC() }}
+		publicBase:    strings.TrimRight(publicBase, "/"),
+		CheckSchedule: DefaultCheckSchedule,
+		log:           log, now: func() time.Time { return time.Now().UTC() }}
+}
+
+// DefaultCheckSchedule: a payment still open is checked 1, 3, 8, 18, 38 and
+// 68 minutes after its checkout opened (then the expiry check takes over), so
+// a lost provider callback costs the customer minutes, not a day.
+var DefaultCheckSchedule = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute,
+	20 * time.Minute, 30 * time.Minute}
+
+func (s *Service) firstCheck() time.Duration {
+	if len(s.CheckSchedule) == 0 {
+		return 0
+	}
+	return s.CheckSchedule[0]
 }
 
 type CreateInput struct {
@@ -59,6 +109,8 @@ type CreateInput struct {
 	Metadata       map[string]string `json:"metadata"`
 	CustomerEmail  string            `json:"customer_email"`
 	CustomerName   string            `json:"customer_name"`
+	CustomerPhone  string            `json:"customer_phone"`
+	CustomerIP     string            `json:"customer_ip"`
 	ReturnURL      string            `json:"return_url"`
 	ExpiresInMin   int               `json:"expires_in_minutes"`
 }
@@ -103,7 +155,9 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (payments.Payment,
 		MerchantID: in.MerchantID, Environment: in.Environment, IdempotencyKey: in.IdempotencyKey,
 		RequestHash: hash, Amount: in.Amount, Currency: in.Currency, Method: in.Method, Provider: in.Provider,
 		Reference: in.Reference, Description: in.Description, Metadata: in.Metadata,
-		CustomerEmail: in.CustomerEmail, CustomerName: in.CustomerName, ReturnURL: in.ReturnURL, TTL: ttl,
+		CustomerEmail: in.CustomerEmail, CustomerName: in.CustomerName, CustomerPhone: in.CustomerPhone,
+		CustomerIP: in.CustomerIP, ReturnURL: in.ReturnURL, TTL: ttl,
+		ReserveBPS: m.Settings.ReserveBPS, ReserveDays: m.Settings.ReserveDays,
 	}, m.FeeBPS, s.now())
 	if err != nil {
 		return payments.Payment{}, false, err
@@ -113,34 +167,117 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (payments.Payment,
 		// No method chosen: the customer picks one on our hosted page.
 		p.CheckoutURL = s.publicBase + "/pay/" + p.ID
 	}
-	if err := s.store.Insert(s.db.WithContext(ctx), p); errors.Is(err, store.ErrDuplicate) {
+	if err := s.insertWithinLimits(ctx, p, m.Settings.Limits[p.Currency]); errors.Is(err, store.ErrDuplicate) {
 		// A concurrent request with the same key won the race.
 		prev, err := s.replay(ctx, in.MerchantID, in.IdempotencyKey, hash)
 		return toAPI(prev), false, err
 	} else if err != nil {
 		return payments.Payment{}, false, err
 	}
+	paymentsCreated.Inc(p.Environment, p.PaymentMethod, p.Currency)
+	if err := s.assess(ctx, p, m.Settings.RiskLevel); err != nil {
+		cur, _ := s.store.Get(s.db.WithContext(ctx), p.ID, false)
+		return toAPI(cur), true, err
+	}
 	if hosted {
 		return toAPI(p), true, nil
 	}
-	p, err = s.start(ctx, p)
+	p, err = s.start(ctx, p, domain.SourceMerchantAPI)
 	return toAPI(p), true, err
+}
+
+// insertWithinLimits stores the payment if the merchant's hard limits allow
+// it. Checked and inserted under a per-merchant lock, so concurrent payments
+// cannot together exceed a daily limit. Fails closed: if the check cannot
+// run, the payment is not created.
+func (s *Service) insertWithinLimits(ctx context.Context, p *domain.Payment, l merchants.Limit) error {
+	by := domain.Actor{Source: domain.SourceMerchantAPI}
+	if l.MaxAmount > 0 && p.Amount > l.MaxAmount {
+		riskOutcomes.Inc("limit_exceeded")
+		return limitError("max_amount", l.MaxAmount, p.Currency)
+	}
+	if l.DailyAmount == 0 && l.DailyCount == 0 {
+		return s.store.Insert(s.db.WithContext(ctx), p, by)
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "payment-limits:"+p.MerchantID+":"+p.Environment+":"+p.Currency).Error; err != nil {
+			return err
+		}
+		total, count, err := s.store.Volume(tx, p.MerchantID, p.Environment, p.Currency, s.now().Add(-24*time.Hour))
+		if err != nil {
+			return err
+		}
+		if l.DailyAmount > 0 && total+p.Amount > l.DailyAmount {
+			riskOutcomes.Inc("limit_exceeded")
+			return limitError("daily_amount", l.DailyAmount, p.Currency)
+		}
+		if l.DailyCount > 0 && count+1 > int64(l.DailyCount) {
+			riskOutcomes.Inc("limit_exceeded")
+			return apperror.Unprocessable("limit_exceeded", fmt.Sprintf("daily_count limit of %d payments reached", l.DailyCount))
+		}
+		return s.store.Insert(tx, p, by)
+	})
+}
+
+func limitError(which string, limit int64, currency string) error {
+	return apperror.Unprocessable("limit_exceeded",
+		fmt.Sprintf("%s limit of %s %s exceeded; ask us to raise it", which, currency, money.FormatMajor(limit)))
+}
+
+// assess asks the risk module. A block fails the payment (recorded in its
+// history). If risk cannot answer, the payment continues and the outage is
+// logged: the hard limits above still apply (fail open for scoring only).
+func (s *Service) assess(ctx context.Context, p *domain.Payment, level string) error {
+	actx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	d, err := bus.Ask(actx, s.bus, risk.Assess{PaymentID: p.ID, MerchantID: p.MerchantID, Environment: p.Environment,
+		Amount: p.Amount, Currency: p.Currency, CustomerEmail: p.CustomerEmail, CustomerPhone: p.CustomerPhone,
+		CustomerIP: p.CustomerIP, RiskLevel: level})
+	if err != nil {
+		riskOutcomes.Inc("risk_unavailable")
+		s.log.Error("ALERT: risk checks unavailable; payment allowed without scoring", "payment_id", p.ID, "err", err)
+		return nil
+	}
+	riskOutcomes.Inc(d.Action)
+	if d.Action != risk.ActionBlock {
+		return nil
+	}
+	reason := "risk_declined: " + strings.Join(d.Reasons, ",")
+	if err := s.fail(ctx, p.ID, reason, domain.Actor{Source: domain.SourceRisk,
+		Details: map[string]any{"score": d.Score, "reasons": d.Reasons}}); err != nil {
+		return err
+	}
+	return apperror.Unprocessable("risk_declined", "this payment was declined by our risk checks")
 }
 
 // start routes the payment's method to a provider and opens the checkout
 // there. The external call happens outside any DB transaction.
-func (s *Service) start(ctx context.Context, p *domain.Payment) (*domain.Payment, error) {
+//
+// Real-money rule: a payment is failed here ONLY when the provider side
+// certainly did not start anything (a refusal, or every provider down before
+// accepting). If the answer is unknown (timeout, lost connection), the
+// customer may already be paying: the payment stays open and the status
+// checks ask the provider until the outcome is known.
+func (s *Service) start(ctx context.Context, p *domain.Payment, source string) (*domain.Payment, error) {
 	res, err := bus.Ask(ctx, s.bus, providers.InitiateCheckout{
 		Method: p.PaymentMethod, Provider: p.Provider, Environment: p.Environment, TxRef: p.ID,
 		Amount: p.Amount, Currency: p.Currency, CustomerEmail: p.CustomerEmail, CustomerName: p.CustomerName,
 		ReturnURL: p.ReturnURL,
 	})
 	if err != nil {
-		reason := "provider_initiation_failed: " + apperror.From(err).Message
-		if ferr := s.fail(ctx, p.ID, reason); ferr != nil {
-			s.log.Error("mark payment failed", "payment_id", p.ID, "err", ferr)
+		if notStarted(err) {
+			reason := "provider_initiation_failed: " + apperror.From(err).Message
+			if ferr := s.fail(ctx, p.ID, reason, domain.Actor{Source: domain.SourceProvider}); ferr != nil {
+				s.log.Error("mark payment failed", "payment_id", p.ID, "err", ferr)
+			}
+			return nil, err
 		}
-		return nil, err
+		s.log.Warn("checkout outcome unknown; payment kept open and will be checked", "payment_id", p.ID, "err", err)
+		res = providers.CheckoutResult{Provider: p.Provider, OutcomeUnknown: true}
+	}
+	by := domain.Actor{Source: source, Provider: res.Provider, Reason: "checkout opened"}
+	if res.OutcomeUnknown {
+		by.Reason = "provider_outcome_unknown: checking with the provider"
 	}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		cur, err := s.store.Get(tx, p.ID, true)
@@ -148,10 +285,14 @@ func (s *Service) start(ctx context.Context, p *domain.Payment) (*domain.Payment
 			return err
 		}
 		if cur.Status == domain.Pending {
-			if err := cur.StartProcessing(res.Provider, res.ProviderRef, res.CheckoutURL, s.now()); err != nil {
+			first := s.firstCheck()
+			if res.OutcomeUnknown && first > 0 {
+				first = min(first, 30*time.Second) // unknown: look sooner
+			}
+			if err := cur.StartProcessing(res.Provider, res.ProviderRef, res.CheckoutURL, first, s.now()); err != nil {
 				return err
 			}
-			if err := s.store.Save(tx, cur); err != nil {
+			if err := s.store.Save(tx, cur, by); err != nil {
 				return err
 			}
 		}
@@ -159,6 +300,17 @@ func (s *Service) start(ctx context.Context, p *domain.Payment) (*domain.Payment
 		return nil
 	})
 	return p, err
+}
+
+// notStarted: the error proves nothing was started at any provider, so the
+// payment can safely be failed.
+func notStarted(err error) bool {
+	ae := apperror.From(err)
+	switch ae.Kind {
+	case apperror.KindInvalid, apperror.KindUnprocessable, apperror.KindForbidden, apperror.KindConflict, apperror.KindNotFound:
+		return true
+	}
+	return ae.Code == providers.ErrProviderUnavailable.Code // every provider refused before accepting it
 }
 
 // ChooseMethod: the customer picked a method on the hosted page. Returns the
@@ -177,7 +329,8 @@ func (s *Service) ChooseMethod(ctx context.Context, id, method string) (string, 
 		if err := p.ChooseMethod(method, s.now()); err != nil {
 			return err
 		}
-		return s.store.Save(tx, p)
+		p.Note("method chosen: "+method, s.now())
+		return s.store.Save(tx, p, domain.Actor{Source: domain.SourceCustomer})
 	})
 	if err != nil {
 		return "", err
@@ -185,10 +338,10 @@ func (s *Service) ChooseMethod(ctx context.Context, id, method string) (string, 
 	if p.Status == domain.Processing {
 		return p.CheckoutURL, nil
 	}
-	if p, err = s.start(ctx, p); err != nil {
+	if p, err = s.start(ctx, p, domain.SourceCustomer); err != nil {
 		return "", err
 	}
-	return p.CheckoutURL, nil
+	return p.CheckoutURL, nil // empty when the outcome is being checked: the page shows the status
 }
 
 // CheckoutView is what the hosted page shows.
@@ -257,19 +410,13 @@ func (s *Service) checkEnvironment(in CreateInput) error {
 	return nil
 }
 
-func (s *Service) fail(ctx context.Context, id, reason string) error {
+func (s *Service) fail(ctx context.Context, id, reason string, by domain.Actor) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		p, err := s.store.Get(tx, id, true)
 		if err != nil {
 			return err
 		}
-		if err := p.Fail(reason, s.now()); err != nil {
-			return err
-		}
-		if err := s.store.Save(tx, p); err != nil {
-			return err
-		}
-		return s.events.Publish(ctx, tx, failedEvent(p))
+		return s.failInTx(ctx, tx, p, reason, s.now(), by)
 	})
 }
 
@@ -284,29 +431,36 @@ func (s *Service) OnProviderTransactionUpdated(ctx context.Context, e bus.Envelo
 		if err != nil {
 			return err
 		}
-		return s.applyProviderResult(ctx, tx, p, evt.Status, evt.Amount, evt.Currency, evt.FailureReason)
+		return s.applyProviderResult(ctx, tx, p, providers.Transaction{Provider: evt.Provider, Status: evt.Status,
+			Amount: evt.Amount, Currency: evt.Currency, FailureReason: evt.FailureReason}, domain.SourceProvider)
 	})
 }
 
 // applyProviderResult records the provider's verified answer on a locked
-// payment. Used by provider events and by the expiry worker.
-func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domain.Payment, status string, amount int64, currency, reason string) error {
-	if p.Settled() || (p.Status == domain.Failed && status != providers.StatusSucceeded) {
+// payment, with who learned it (source) in the history.
+func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domain.Payment, r providers.Transaction, source string) error {
+	if p.Settled() || (p.Status == domain.Failed && r.Status != providers.StatusSucceeded) {
 		return nil
 	}
 	now := s.now()
-	switch status {
+	by := domain.Actor{Source: source, Provider: r.Provider, Details: map[string]any{
+		"provider_status": r.Status, "amount": r.Amount, "currency": r.Currency}}
+	if r.FailureReason != "" {
+		by.Details["failure_reason"] = r.FailureReason
+	}
+	switch r.Status {
 	case providers.StatusSucceeded:
-		if amount != p.Amount || currency != p.Currency {
+		if r.Amount != p.Amount || r.Currency != p.Currency {
 			s.log.Error("provider amount mismatch", "payment_id", p.ID,
-				"expected", p.Amount, "got", amount, "currency", currency)
+				"expected", p.Amount, "got", r.Amount, "currency", r.Currency)
 			if p.Status == domain.Failed {
 				return nil
 			}
-			return s.failInTx(ctx, tx, p, "amount_mismatch", now)
+			return s.failInTx(ctx, tx, p, "amount_mismatch", now, by)
 		}
 		if p.Status == domain.Expired || p.Status == domain.Failed {
 			s.log.Warn("payment completed after "+string(p.Status)+"; honouring the provider's capture", "payment_id", p.ID)
+			by.Reason = "paid after " + string(p.Status) + ": the provider confirmed the capture"
 			p.FailureReason = ""
 		}
 		// If the payment is still pending (checkout response not yet saved)
@@ -314,21 +468,148 @@ func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domai
 		if err := p.TransitionTo(domain.Succeeded, now); err != nil {
 			return err
 		}
-		if err := s.store.Save(tx, p); err != nil {
+		if err := s.store.Save(tx, p, by); err != nil {
 			return err
 		}
+		paymentsFinal.Inc(p.Environment, string(domain.Succeeded), p.Provider, "")
 		return s.events.Publish(ctx, tx, payments.PaymentSucceeded{
 			PaymentID: p.ID, MerchantID: p.MerchantID, Environment: p.Environment, Amount: p.Amount,
-			Fee: p.Fee, Currency: p.Currency, Provider: p.Provider, ProviderRef: p.ProviderRef,
+			Fee: p.Fee, Reserve: p.Reserve, ReserveDays: p.ReserveDays, Currency: p.Currency, Provider: p.Provider, ProviderRef: p.ProviderRef,
 			Reference: p.Reference, Metadata: p.Metadata, OccurredAt: now,
 		})
 	case providers.StatusFailed:
+		reason := r.FailureReason
 		if reason == "" {
 			reason = "declined_by_provider"
 		}
-		return s.failInTx(ctx, tx, p, reason, now)
+		return s.failInTx(ctx, tx, p, reason, now, by)
 	}
 	return nil
+}
+
+// StatusCheckWorker verifies open payments with the provider on the check
+// schedule. It finds payments whose callback was lost or delayed (common
+// with mobile money and USSD push) within minutes. Safe with many replicas.
+func (s *Service) StatusCheckWorker(ctx context.Context) {
+	every := s.CheckEvery
+	if every <= 0 {
+		every = 5 * time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if _, err := s.CheckDue(ctx, 50); err != nil && ctx.Err() == nil {
+			s.log.Error("payment status checks", "err", err)
+		}
+	}
+}
+
+// CheckDue runs up to limit due status checks; returns how many resolved.
+func (s *Service) CheckDue(ctx context.Context, limit int) (int, error) {
+	due, err := s.store.ClaimDueChecks(s.db.WithContext(ctx), s.now(), 2*time.Minute, limit)
+	if err != nil {
+		return 0, err
+	}
+	resolved := 0
+	for _, d := range due {
+		remote, verr := bus.Ask(ctx, s.bus, providers.VerifyTransaction{Provider: d.Provider, TxRef: d.ID})
+		err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			cur, err := s.store.Get(tx, d.ID, true)
+			if err != nil || cur.Status != domain.Processing {
+				return err
+			}
+			if verr == nil && (remote.Status == providers.StatusSucceeded || remote.Status == providers.StatusFailed) {
+				resolved++
+				return s.applyProviderResult(ctx, tx, cur, remote, domain.SourceStatusCheck)
+			}
+			if verr != nil {
+				s.log.Warn("status check failed, will retry", "payment_id", d.ID, "err", verr)
+			}
+			cur.ScheduleCheck(s.CheckSchedule, s.now())
+			return s.store.Save(tx, cur, domain.Actor{})
+		})
+		if err != nil {
+			s.log.Error("status check", "payment_id", d.ID, "err", err)
+		}
+	}
+	return resolved, nil
+}
+
+// Sync asks the provider for the payment's status now and applies it
+// (payments.SyncPayment; used by reconciliation to repair a difference).
+func (s *Service) Sync(ctx context.Context, q payments.SyncPayment) (payments.Payment, error) {
+	p, err := s.store.Get(s.db.WithContext(ctx), q.PaymentID, false)
+	if err != nil {
+		return payments.Payment{}, err
+	}
+	if p.Status == domain.Pending {
+		return toAPI(p), nil // never sent to a provider
+	}
+	remote, err := bus.Ask(ctx, s.bus, providers.VerifyTransaction{Provider: p.Provider, TxRef: p.ID})
+	if err != nil {
+		return payments.Payment{}, err
+	}
+	source := q.Source
+	if source == "" {
+		source = domain.SourceSystem
+	}
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		cur, err := s.store.Get(tx, p.ID, true)
+		if err != nil {
+			return err
+		}
+		if q.Note != "" {
+			cur.Note(q.Note, s.now())
+		}
+		if err := s.applyProviderResult(ctx, tx, cur, remote, source); err != nil {
+			return err
+		}
+		if err := s.store.Save(tx, cur, domain.Actor{Source: source}); err != nil { // the note, if nothing changed
+			return err
+		}
+		p = cur
+		return nil
+	})
+	return toAPI(p), err
+}
+
+// History is a payment's history, for its merchant (or any, when
+// merchantID is empty: platform staff).
+func (s *Service) History(ctx context.Context, merchantID, id string) ([]store.Event, error) {
+	p, err := s.store.Get(s.db.WithContext(ctx), id, false)
+	if err != nil {
+		return nil, err
+	}
+	if merchantID != "" && p.MerchantID != merchantID {
+		return nil, payments.ErrNotFound
+	}
+	return s.store.History(s.db.WithContext(ctx), id)
+}
+
+// GetAny returns any merchant's payment (platform staff).
+func (s *Service) GetAny(ctx context.Context, id string) (payments.Payment, error) {
+	p, err := s.store.Get(s.db.WithContext(ctx), id, false)
+	if err != nil {
+		return payments.Payment{}, err
+	}
+	return toAPI(p), nil
+}
+
+// GetByIDs answers payments.GetPaymentsByID.
+func (s *Service) GetByIDs(ctx context.Context, q payments.GetPaymentsByID) ([]payments.Payment, error) {
+	if len(q.IDs) > 500 {
+		return nil, apperror.Invalid("too_many_ids", "at most 500 ids per request")
+	}
+	ps, err := s.store.GetByIDs(s.db.WithContext(ctx), q.IDs)
+	if err != nil {
+		return nil, err
+	}
+	return toAPIList(ps), nil
 }
 
 // ExpiryWorker closes payments the customer did not complete in time. Before
@@ -363,6 +644,10 @@ func (s *Service) ExpireDue(ctx context.Context, limit int) (int, error) {
 	changed := 0
 	for _, p := range due {
 		remote, verr := bus.Ask(ctx, s.bus, providers.VerifyTransaction{Provider: p.Provider, TxRef: p.ID})
+		if errors.Is(verr, providers.ErrTransactionNotFound) {
+			verr = nil // the provider never received it: nothing can complete later
+			remote = providers.Transaction{Status: providers.StatusPending}
+		}
 		if verr != nil && p.Status == domain.Processing && s.now().Sub(p.ExpiresAt) < 24*time.Hour {
 			// Provider unreachable: try again next round rather than guess.
 			s.log.Warn("verify before expiry failed, will retry", "payment_id", p.ID, "err", verr)
@@ -375,12 +660,14 @@ func (s *Service) ExpireDue(ctx context.Context, limit int) (int, error) {
 			}
 			if verr == nil && (remote.Status == providers.StatusSucceeded || remote.Status == providers.StatusFailed) {
 				changed++
-				return s.applyProviderResult(ctx, tx, cur, remote.Status, remote.Amount, remote.Currency, remote.FailureReason)
+				return s.applyProviderResult(ctx, tx, cur, remote, domain.SourceStatusCheck)
 			}
 			if err := cur.Expire(s.now()); err != nil {
 				return err
 			}
-			if err := s.store.Save(tx, cur); err != nil {
+			paymentsFinal.Inc(cur.Environment, string(domain.Expired), cur.Provider, "")
+			if err := s.store.Save(tx, cur, domain.Actor{Source: domain.SourceExpiry,
+				Details: map[string]any{"provider_status": remote.Status}}); err != nil {
 				return err
 			}
 			changed++
@@ -395,11 +682,13 @@ func (s *Service) ExpireDue(ctx context.Context, limit int) (int, error) {
 	return changed, nil
 }
 
-func (s *Service) failInTx(ctx context.Context, tx *gorm.DB, p *domain.Payment, reason string, now time.Time) error {
+func (s *Service) failInTx(ctx context.Context, tx *gorm.DB, p *domain.Payment, reason string, now time.Time, by domain.Actor) error {
 	if err := p.Fail(reason, now); err != nil {
 		return err
 	}
-	if err := s.store.Save(tx, p); err != nil {
+	short, _, _ := strings.Cut(reason, ":") // e.g. "risk_declined", "insufficient_funds"
+	paymentsFinal.Inc(p.Environment, string(domain.Failed), p.Provider, short)
+	if err := s.store.Save(tx, p, by); err != nil {
 		return err
 	}
 	return s.events.Publish(ctx, tx, failedEvent(p))
@@ -415,7 +704,8 @@ func (s *Service) OnRefundSucceeded(ctx context.Context, e bus.Envelope, evt ref
 		if err := p.ApplyRefund(evt.Amount, s.now()); err != nil {
 			return err
 		}
-		return s.store.Save(tx, p)
+		return s.store.Save(tx, p, domain.Actor{Source: domain.SourceRefund, Reason: "refund " + evt.RefundID,
+			Details: map[string]any{"refund_id": evt.RefundID, "amount": evt.Amount, "currency": evt.Currency}})
 	})
 }
 
@@ -486,7 +776,8 @@ func toAPI(p *domain.Payment) payments.Payment {
 		RefundedAmount: p.RefundedAmount, Currency: p.Currency, Status: string(p.Status),
 		PaymentMethod: p.PaymentMethod, Provider: p.Provider,
 		ProviderRef: p.ProviderRef, Reference: p.Reference, Description: p.Description, Metadata: meta,
-		CustomerEmail: p.CustomerEmail, CustomerName: p.CustomerName, ReturnURL: p.ReturnURL,
+		CustomerEmail: p.CustomerEmail, CustomerName: p.CustomerName, CustomerPhone: p.CustomerPhone, ReturnURL: p.ReturnURL,
+		Reserve: p.Reserve, ReserveDays: p.ReserveDays,
 		CheckoutURL: p.CheckoutURL, FailureReason: p.FailureReason, ExpiresAt: p.ExpiresAt,
 		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 	}
@@ -498,4 +789,30 @@ func toAPIList(ps []domain.Payment) []payments.Payment {
 		out[i] = toAPI(&ps[i])
 	}
 	return out
+}
+
+// OnDisputeOpened / OnDisputeClosed note the chargeback in the payment's
+// history (the payment's status does not change: the money moves in the
+// ledger).
+func (s *Service) OnDisputeOpened(ctx context.Context, e bus.Envelope, evt disputes.DisputeOpened) error {
+	return s.disputeNote(ctx, e, "payment.on_dispute_opened", evt.PaymentID,
+		fmt.Sprintf("dispute %s opened: %s, %s held", evt.DisputeID, evt.Reason, money.FormatMajor(evt.Amount)+" "+evt.Currency))
+}
+
+func (s *Service) OnDisputeClosed(ctx context.Context, e bus.Envelope, evt disputes.DisputeClosed) error {
+	return s.disputeNote(ctx, e, "payment.on_dispute_closed", evt.PaymentID, "dispute "+evt.DisputeID+" "+evt.Outcome)
+}
+
+func (s *Service) disputeNote(ctx context.Context, e bus.Envelope, consumer, paymentID, note string) error {
+	return events.HandleOnce(ctx, s.db, consumer, e, func(tx *gorm.DB) error {
+		p, err := s.store.Get(tx, paymentID, true)
+		if errors.Is(err, payments.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		p.Note(note, s.now())
+		return s.store.Save(tx, p, domain.Actor{Source: domain.SourceDispute})
+	})
 }

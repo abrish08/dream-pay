@@ -43,7 +43,13 @@ func New(d Deps) *Module {
 }
 
 // Asks:      payments.GetPayment, providers.Refund
+// Handles:   refunds.GetRefundsByID, refunds.ListRefunds
 // Publishes: refunds.RefundSucceeded, refunds.RefundFailed
 func (m *Module) RegisterRoutes(r module.Routers) {
 	transport.NewHTTP(m.svc, m.Log).RegisterPublic(r.Public)
+}
+
+func (m *Module) RegisterHandlers(b bus.Bus) {
+	bus.Handle(b, m.svc.GetByIDs)
+	bus.Handle(b, m.svc.ListAll)
 }

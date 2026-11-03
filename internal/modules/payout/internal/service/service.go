@@ -35,6 +35,10 @@ type Service struct {
 	bus    bus.Bus
 	log    *slog.Logger
 	now    func() time.Time
+	// ScheduleEvery: how often scheduled payouts are checked (default 10 minutes).
+	ScheduleEvery time.Duration
+	// Location: the business day of scheduled payouts (default UTC).
+	Location *time.Location
 }
 
 func New(db *gorm.DB, pub events.Publisher, b bus.Bus, log *slog.Logger) *Service {
@@ -264,13 +268,93 @@ func (s *Service) replay(q *gorm.DB, merchantID, key, hash string) (*domain.Payo
 		return nil, err
 	}
 	if prev.RequestHash != hash {
-		return nil, apperror.Conflict("idempotency_key_reused", "this Idempotency-Key was already used with a different request body")
+		return nil, payoutKeyReused
 	}
 	return prev, nil
 }
+
+var payoutKeyReused = apperror.Conflict("idempotency_key_reused", "this Idempotency-Key was already used with a different request body")
 
 func hashOf(in RequestInput) string {
 	b, _ := json.Marshal(in)
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
+}
+
+// ---- Scheduled payouts ----
+
+// ScheduleWorker pays out available balances of merchants with a daily or
+// weekly schedule, to the bank account staff verified. Live money only. At
+// most one scheduled payout per merchant, currency and business day: the
+// idempotency key "schedule:<currency>:<date>" makes repeats impossible, also
+// with many replicas.
+func (s *Service) ScheduleWorker(ctx context.Context) {
+	every := s.ScheduleEvery
+	if every <= 0 {
+		every = 10 * time.Minute
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if _, err := s.RunSchedules(ctx); err != nil && ctx.Err() == nil {
+			s.log.Error("scheduled payouts", "err", err)
+		}
+	}
+}
+
+// RunSchedules creates the payouts due now; returns how many were created.
+func (s *Service) RunSchedules(ctx context.Context) (int, error) {
+	schedules, err := bus.Ask(ctx, s.bus, merchants.ListPayoutSchedules{})
+	if err != nil {
+		return 0, err
+	}
+	local := s.now().In(s.loc())
+	day := local.Format("2006-01-02")
+	weekday := int(local.Weekday())
+	if weekday == 0 {
+		weekday = 7 // Sunday
+	}
+	created := 0
+	for _, sc := range schedules {
+		p := sc.Payout
+		if p.Bank == nil || (p.Schedule == merchants.PayoutWeekly && p.Weekday != weekday) {
+			continue
+		}
+		for _, cur := range p.Currencies {
+			bal, err := bus.Ask(ctx, s.bus, ledger.GetBalance{MerchantID: sc.MerchantID, Environment: "live", Currency: cur})
+			if err != nil {
+				s.log.Warn("scheduled payout: balance unavailable", "merchant_id", sc.MerchantID, "err", err)
+				continue
+			}
+			if bal.Available < max(p.MinAmount, domain.MinPayout) {
+				continue
+			}
+			_, isNew, err := s.Request(ctx, reqctx.Principal{MerchantID: sc.MerchantID, Subject: "payout_schedule", Environment: "live"},
+				"schedule:"+cur+":"+day, RequestInput{Amount: bal.Available, Currency: cur, Environment: "live",
+					BankAccount: domain.BankAccount{BankName: p.Bank.BankName, AccountNumber: p.Bank.AccountNumber, AccountName: p.Bank.AccountName},
+					Description: p.Schedule + " payout " + day})
+			switch {
+			case errors.Is(err, payoutKeyReused):
+				// already paid out today (the balance changed since): nothing to do
+			case err != nil:
+				s.log.Warn("scheduled payout failed", "merchant_id", sc.MerchantID, "currency", cur, "err", err)
+			case isNew:
+				created++
+				s.log.Info("scheduled payout created", "merchant_id", sc.MerchantID, "currency", cur, "amount", bal.Available)
+			}
+		}
+	}
+	return created, nil
+}
+
+func (s *Service) loc() *time.Location {
+	if s.Location != nil {
+		return s.Location
+	}
+	return time.UTC
 }

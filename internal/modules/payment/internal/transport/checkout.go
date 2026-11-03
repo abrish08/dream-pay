@@ -81,5 +81,8 @@ func (h *HTTP) chooseMethod(w http.ResponseWriter, r *http.Request) {
 		h.renderCheckout(w, r, "This payment method could not be started. Please choose another or try again.")
 		return
 	}
+	if url == "" { // the provider's answer is being confirmed: show the payment's status
+		url = "/pay/" + chi.URLParam(r, "id")
+	}
 	http.Redirect(w, r, url, http.StatusSeeOther)
 }

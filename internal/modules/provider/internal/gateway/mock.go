@@ -33,9 +33,27 @@ func (m *Mock) IsSandbox() bool { return true }
 func (m *Mock) Methods() []string    { return providers.Methods }
 func (m *Mock) Currencies() []string { return []string{"ETB", "USD"} }
 
+// Sandbox amounts that simulate provider trouble (any currency):
+//
+//	...9.99 (amount % 1000 == 999): the provider receives the request but its
+//	        answer never arrives (timeout). The customer can still pay on
+//	        /providers/mock/checkout/{id}; the status checks find it.
+//	...9.98 (amount % 1000 == 998): the provider refuses the connection
+//	        (nothing sent): the payment fails at once.
+const (
+	MockOutcomeUnknown = 999
+	MockUnreachable    = 998
+)
+
 func (m *Mock) Initiate(ctx context.Context, req providers.InitiateCheckout, _ string) (providers.CheckoutResult, error) {
+	if req.Amount%1000 == MockUnreachable {
+		return providers.CheckoutResult{}, providers.ErrProviderUnavailable.WithMessage("sandbox: connection refused")
+	}
 	if err := m.state.SaveMock(ctx, req.TxRef, req.Amount, req.Currency, providers.StatusPending); err != nil {
 		return providers.CheckoutResult{}, err
+	}
+	if req.Amount%1000 == MockOutcomeUnknown {
+		return providers.CheckoutResult{}, providers.ErrOutcomeUnknown.WithMessage("sandbox: no answer from the provider")
 	}
 	return providers.CheckoutResult{
 		CheckoutURL: m.baseURL + "/providers/mock/checkout/" + req.TxRef,

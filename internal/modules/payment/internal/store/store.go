@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -23,16 +24,124 @@ type Store struct{ db *gorm.DB }
 
 func New(db *gorm.DB) *Store { return &Store{db: db} }
 
-func (s *Store) Insert(q *gorm.DB, p *domain.Payment) error {
-	err := q.Table(table).Create(p).Error
-	if errors.Is(err, gorm.ErrDuplicatedKey) {
-		return ErrDuplicate
-	}
-	return err
+// Insert creates the payment and the first entry of its history together.
+func (s *Store) Insert(q *gorm.DB, p *domain.Payment, by domain.Actor) error {
+	return q.Transaction(func(tx *gorm.DB) error {
+		err := tx.Table(table).Create(p).Error
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return ErrDuplicate
+		}
+		if err != nil {
+			return err
+		}
+		return s.writeHistory(tx, p, by)
+	})
 }
 
-func (s *Store) Save(q *gorm.DB, p *domain.Payment) error {
-	return q.Table(table).Where("id = ?", p.ID).Select("*").Updates(p).Error
+// Save stores the payment and appends its pending changes to the history.
+// Call it inside the transaction that made the change, so the history can
+// never disagree with the payment.
+func (s *Store) Save(q *gorm.DB, p *domain.Payment, by domain.Actor) error {
+	if err := q.Table(table).Where("id = ?", p.ID).Select("*").Omit("changes").Updates(p).Error; err != nil {
+		return err
+	}
+	return s.writeHistory(q, p, by)
+}
+
+// Event is one row of payment_events (append-only).
+type Event struct {
+	ID         int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	PaymentID  string    `json:"-"`
+	FromStatus string    `json:"from_status"`
+	ToStatus   string    `json:"to_status"`
+	Source     string    `json:"source"`
+	Reason     string    `json:"reason,omitempty"`
+	Provider   string    `json:"provider,omitempty"`
+	Details    string    `gorm:"type:jsonb" json:"-"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+func (Event) TableName() string { return "payment_events" }
+
+func (s *Store) writeHistory(q *gorm.DB, p *domain.Payment, by domain.Actor) error {
+	changes := p.Changes()
+	if len(changes) == 0 {
+		return nil
+	}
+	details := "{}"
+	if len(by.Details) > 0 {
+		b, err := json.Marshal(by.Details)
+		if err != nil {
+			return err
+		}
+		details = string(b)
+	}
+	provider := by.Provider
+	if provider == "" {
+		provider = p.Provider
+	}
+	rows := make([]Event, 0, len(changes))
+	for _, c := range changes {
+		reason := by.Reason
+		switch {
+		case c.Note != "":
+			reason = c.Note
+		case reason == "" && (c.To == domain.Failed || c.To == domain.Expired):
+			reason = p.FailureReason
+		}
+		source := by.Source
+		if source == "" {
+			source = domain.SourceSystem
+		}
+		rows = append(rows, Event{PaymentID: p.ID, FromStatus: string(c.From), ToStatus: string(c.To), Source: source,
+			Reason: reason, Provider: provider, Details: details, CreatedAt: c.At})
+	}
+	if err := q.Create(&rows).Error; err != nil {
+		return err
+	}
+	p.ClearChanges()
+	return nil
+}
+
+// History returns a payment's events, oldest first.
+func (s *Store) History(q *gorm.DB, paymentID string) ([]Event, error) {
+	var out []Event
+	err := q.Where("payment_id = ?", paymentID).Order("id").Find(&out).Error
+	return out, err
+}
+
+// GetByIDs returns the payments with these ids (unknown ids are skipped).
+func (s *Store) GetByIDs(q *gorm.DB, ids []string) ([]domain.Payment, error) {
+	valid := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, err := uuid.Parse(id); err == nil {
+			valid = append(valid, id)
+		}
+	}
+	var out []domain.Payment
+	if len(valid) == 0 {
+		return out, nil
+	}
+	err := q.Table(table).Where("id IN ?", valid).Find(&out).Error
+	return out, err
+}
+
+// DueCheck is an open payment whose next status check is due.
+type DueCheck struct {
+	ID       string
+	Provider string
+}
+
+// ClaimDueChecks takes up to limit payments whose status check is due and
+// pushes their next_check_at forward by lease, so another replica does not
+// check them at the same time (FOR UPDATE SKIP LOCKED).
+func (s *Store) ClaimDueChecks(q *gorm.DB, now time.Time, lease time.Duration, limit int) ([]DueCheck, error) {
+	var out []DueCheck
+	err := q.Raw(`UPDATE payments SET next_check_at = $1
+		WHERE id IN (SELECT id FROM payments WHERE status = 'processing' AND next_check_at <= $2
+		             ORDER BY next_check_at LIMIT $3 FOR UPDATE SKIP LOCKED)
+		RETURNING id, provider`, now.Add(lease), now, limit).Scan(&out).Error
+	return out, err
 }
 
 func (s *Store) Get(q *gorm.DB, id string, forUpdate bool) (*domain.Payment, error) {
@@ -122,6 +231,9 @@ func (s *Store) DueForExpiry(q *gorm.DB, now time.Time, limit int) ([]domain.Pay
 
 func (s *Store) List(q *gorm.DB, f payments.ListPayments) ([]domain.Payment, error) {
 	q = q.Table(table)
+	if f.Provider != "" {
+		q = q.Where("provider = ?", f.Provider)
+	}
 	if len(f.Statuses) > 0 {
 		q = q.Where("status IN ?", f.Statuses)
 	}
@@ -141,4 +253,18 @@ func (s *Store) List(q *gorm.DB, f payments.ListPayments) ([]domain.Payment, err
 	var out []domain.Payment
 	err := q.Order("id").Limit(limit).Find(&out).Error
 	return out, err
+}
+
+// Volume: total and count of a merchant's payments since t that can still
+// take or have taken money (failed and expired ones do not count).
+func (s *Store) Volume(q *gorm.DB, merchantID, env, currency string, since time.Time) (int64, int64, error) {
+	var row struct {
+		Total int64
+		N     int64
+	}
+	err := q.Table(table).Select("COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n").
+		Where("merchant_id = ? AND environment = ? AND currency = ? AND created_at >= ? AND status IN ?", merchantID, env, currency, since,
+			[]string{string(domain.Pending), string(domain.Processing), string(domain.Succeeded),
+				string(domain.PartiallyRefunded), string(domain.Refunded)}).Scan(&row).Error
+	return row.Total, row.N, err
 }

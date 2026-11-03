@@ -92,3 +92,51 @@ func (s *Store) TrialBalance(q *gorm.DB) ([]TrialBalanceRow, error) {
 	}
 	return rows, err
 }
+
+// PostingTotals: reference, currency and total debits of each posting found.
+func (s *Store) PostingTotals(q *gorm.DB, refs []string) ([]PostingTotal, error) {
+	var out []PostingTotal
+	if len(refs) == 0 {
+		return out, nil
+	}
+	err := q.Table("ledger_transactions AS t").
+		Select("t.reference, t.currency, COALESCE(SUM(e.debit), 0) AS amount").
+		Joins("JOIN ledger_entries e ON e.transaction_id = t.id").
+		Where("t.reference IN ?", refs).Group("t.reference, t.currency").Scan(&out).Error
+	return out, err
+}
+
+type PostingTotal struct {
+	Reference string
+	Currency  string
+	Amount    int64
+}
+
+// ReserveHold: a payment's reserve waiting for its release date.
+type ReserveHold struct {
+	PaymentID   string `gorm:"primaryKey"`
+	MerchantID  string
+	Environment string
+	Currency    string
+	Amount      int64
+	ReleaseAt   time.Time
+	ReleasedAt  *time.Time
+}
+
+func (ReserveHold) TableName() string { return "reserve_holds" }
+
+func (s *Store) AddHold(q *gorm.DB, h *ReserveHold) error {
+	return q.Clauses(clause.OnConflict{DoNothing: true}).Create(h).Error
+}
+
+// ClaimDueHolds locks due holds (SKIP LOCKED: safe with many replicas).
+func (s *Store) ClaimDueHolds(q *gorm.DB, now time.Time, limit int) ([]ReserveHold, error) {
+	var out []ReserveHold
+	err := q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+		Where("released_at IS NULL AND release_at <= ?", now).Order("release_at").Limit(limit).Find(&out).Error
+	return out, err
+}
+
+func (s *Store) MarkReleased(q *gorm.DB, paymentID string, now time.Time) error {
+	return q.Model(&ReserveHold{}).Where("payment_id = ?", paymentID).Update("released_at", now).Error
+}

@@ -5,6 +5,7 @@ package domain
 import (
 	"fmt"
 
+	"paygate/internal/contracts/disputes"
 	"paygate/internal/contracts/payments"
 	"paygate/internal/contracts/payouts"
 	"paygate/internal/contracts/refunds"
@@ -58,6 +59,16 @@ func MerchantPayoutsPending(merchantID, env string) string {
 	return "merchant:" + merchantID + ":payouts_pending:" + env
 }
 
+// MerchantReserve: the merchant's money held as a rolling reserve.
+func MerchantReserve(merchantID, env string) string {
+	return "merchant:" + merchantID + ":reserve:" + env
+}
+
+// MerchantDisputeHold: the merchant's money held for open disputes.
+func MerchantDisputeHold(merchantID, env string) string {
+	return "merchant:" + merchantID + ":dispute_hold:" + env
+}
+
 // SettlementBank: the platform's bank account that payouts are sent from.
 func SettlementBank(env string) string { return "platform:settlement_bank:" + env }
 
@@ -88,10 +99,17 @@ func PayoutReleased(e payouts.PayoutFailed) Posting {
 
 // PaymentCaptured: the provider owes us the gross amount; we owe the merchant
 // the net amount; the platform earns the fee.
+// Any reserve is credited to the merchant's reserve account instead of the
+// available balance, and released later (ReserveReleased).
 func PaymentCaptured(e payments.PaymentSucceeded) Posting {
 	lines := []Line{{Account: ProviderClearing(e.Provider, e.Environment), Debit: e.Amount}}
-	if net := e.Amount - e.Fee; net > 0 {
-		lines = append(lines, Line{Account: MerchantAvailable(e.MerchantID, e.Environment), Credit: net})
+	net := e.Amount - e.Fee
+	reserve := min(max(e.Reserve, 0), max(net, 0))
+	if available := net - reserve; available > 0 {
+		lines = append(lines, Line{Account: MerchantAvailable(e.MerchantID, e.Environment), Credit: available})
+	}
+	if reserve > 0 {
+		lines = append(lines, Line{Account: MerchantReserve(e.MerchantID, e.Environment), Credit: reserve})
 	}
 	if e.Fee > 0 {
 		lines = append(lines, Line{Account: PlatformFees(e.Environment), Credit: e.Fee})
@@ -108,4 +126,40 @@ func RefundSucceeded(e refunds.RefundSucceeded) Posting {
 			{Account: MerchantAvailable(e.MerchantID, e.Environment), Debit: e.Amount},
 			{Account: ProviderClearing(e.Provider, e.Environment), Credit: e.Amount},
 		}}
+}
+
+// ReserveReleased: a payment's reserve becomes available after its days.
+func ReserveReleased(paymentID, merchantID, env, currency string, amount int64) Posting {
+	return Posting{Reference: "reserve:" + paymentID + ":released", Currency: currency, Description: "reserve released",
+		Lines: []Line{
+			{Account: MerchantReserve(merchantID, env), Debit: amount},
+			{Account: MerchantAvailable(merchantID, env), Credit: amount},
+		}}
+}
+
+// DisputeOpened: the disputed amount leaves the merchant's available balance
+// and is held until the dispute is decided.
+func DisputeOpened(e disputes.DisputeOpened) Posting {
+	return Posting{Reference: "dispute:" + e.DisputeID + ":opened", Currency: e.Currency,
+		Description: "dispute on payment " + e.PaymentID, Lines: []Line{
+			{Account: MerchantAvailable(e.MerchantID, e.Environment), Debit: e.Amount},
+			{Account: MerchantDisputeHold(e.MerchantID, e.Environment), Credit: e.Amount},
+		}}
+}
+
+// DisputeClosed: won, the hold goes back to the merchant; lost, the provider
+// returns it to the cardholder (it owes us that much less) and the dispute
+// fee is charged.
+func DisputeClosed(e disputes.DisputeClosed) Posting {
+	hold := MerchantDisputeHold(e.MerchantID, e.Environment)
+	if e.Outcome == disputes.OutcomeWon {
+		return Posting{Reference: "dispute:" + e.DisputeID + ":closed", Currency: e.Currency, Description: "dispute won",
+			Lines: []Line{{Account: hold, Debit: e.Amount}, {Account: MerchantAvailable(e.MerchantID, e.Environment), Credit: e.Amount}}}
+	}
+	lines := []Line{{Account: hold, Debit: e.Amount}, {Account: ProviderClearing(e.Provider, e.Environment), Credit: e.Amount}}
+	if e.Fee > 0 {
+		lines = append(lines, Line{Account: MerchantAvailable(e.MerchantID, e.Environment), Debit: e.Fee},
+			Line{Account: PlatformFees(e.Environment), Credit: e.Fee})
+	}
+	return Posting{Reference: "dispute:" + e.DisputeID + ":closed", Currency: e.Currency, Description: "dispute lost", Lines: lines}
 }

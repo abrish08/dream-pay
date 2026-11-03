@@ -112,12 +112,22 @@ func TestBreakerMovesTrafficToBackup(t *testing.T) {
 	}
 }
 
+// TestRetryable: fail over only when the request certainly did not arrive.
 func TestRetryable(t *testing.T) {
-	if !Retryable(errors.New("dial tcp: timeout")) || !Retryable(providers.ErrProviderUnavailable) {
-		t.Fatal("outages must fail over")
+	if !Retryable(providers.ErrProviderUnavailable) {
+		t.Fatal("a provider that refused the connection must fail over")
 	}
-	if Retryable(apperror.Invalid("invalid_phone", "bad phone number")) {
-		t.Fatal("a business error must not be retried at another provider")
+	for _, err := range []error{
+		errors.New("read tcp: i/o timeout"), // may have been received
+		providers.ErrOutcomeUnknown,
+		apperror.Invalid("invalid_phone", "bad phone number"), // would fail elsewhere too
+	} {
+		if Retryable(err) {
+			t.Errorf("%v must not be sent to another provider", err)
+		}
+	}
+	if !NotSent(apperror.Invalid("invalid_phone", "bad phone number")) || NotSent(errors.New("read tcp: i/o timeout")) {
+		t.Fatal("NotSent")
 	}
 }
 
