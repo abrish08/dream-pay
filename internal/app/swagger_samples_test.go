@@ -220,6 +220,7 @@ func (f *fixtures) fill(method, path string) string {
 	}
 	id := map[string]string{
 		"/v1/payments/{id}": f.payment, "/v1/refunds/{id}": f.refund, "/v1/payouts/{id}": f.payout,
+		"/v1/payments/{id}/events": f.payment, "/admin/payments/{id}": f.payment, "/admin/payments/{id}/events": f.payment,
 		"/v1/webhook-endpoints/{id}": f.webhook, "/v1/webhook-endpoints/{id}/rotate-secret": f.webhook,
 		"/v1/webhook-deliveries/{id}/retry": f.delivery,
 		"/v1/api-keys/{id}":                 f.keyDel, "/v1/api-keys/{id}/roll": f.keyRoll,
@@ -258,7 +259,7 @@ func (f *fixtures) callerFor(method, path string, open bool) string {
 		return f.c.admin
 	case strings.HasPrefix(path, "/auth"), strings.HasPrefix(path, "/v1/api-keys"), strings.HasPrefix(path, "/v1/team"),
 		strings.HasPrefix(path, "/v1/roles"), path == "/v1/permissions", path == "/v1/audit-log",
-		strings.HasPrefix(path, "/v1/payouts"), path == "/v1/merchant", strings.HasPrefix(path, "/v1/kyc"):
+		strings.HasPrefix(path, "/v1/payouts"), path == "/v1/merchant", strings.HasPrefix(path, "/v1/kyc"), strings.HasPrefix(path, "/v1/disputes"):
 		return f.owner
 	}
 	return f.key
@@ -307,6 +308,10 @@ func (f *fixtures) send(method, path, token string, b body) sent {
 			_, _ = part.Write(samplePDF)
 			_ = w.Close()
 			rdr, ctype = &buf, w.FormDataContentType()
+			continue
+		}
+		if str, ok := ex.(string); ok && media == "text/csv" {
+			rdr, ctype = strings.NewReader(str), media
 			continue
 		}
 		if media == "application/x-www-form-urlencoded" {

@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"paygate/internal/modules/provider/internal/gateway"
 	"paygate/internal/modules/provider/internal/store"
 	"paygate/internal/platform/events"
+	"paygate/internal/platform/metrics"
 	"paygate/internal/platform/money"
 )
 
@@ -46,60 +46,125 @@ func (s *Service) gateway(name string) (gateway.Gateway, error) {
 }
 
 // InitiateCheckout routes the payment method to a provider and starts the
-// checkout there, failing over to the next provider in the route when one is
-// unavailable. Idempotent per tx_ref.
+// checkout there. Real-money rules:
+//
+//   - The attempt is recorded BEFORE the provider is called, so a crash or a
+//     timeout leaves a record that can be verified later.
+//   - It fails over to the next provider ONLY when the previous one certainly
+//     did not receive the request (providers.ErrProviderUnavailable). After a
+//     timeout the request may have reached the provider (a USSD push may be on
+//     the customer's phone): sending it elsewhere could charge twice, so the
+//     result is reported as OutcomeUnknown and the status is checked later.
+//   - Idempotent per tx_ref: a repeated call never sends a second request.
 func (s *Service) InitiateCheckout(ctx context.Context, req providers.InitiateCheckout) (providers.CheckoutResult, error) {
-	if t, err := s.store.GetTransaction(s.store.DB(ctx), req.TxRef, false); err == nil {
-		return providers.CheckoutResult{CheckoutURL: t.CheckoutURL, ProviderRef: t.ProviderRef, Provider: t.Provider}, nil
-	} else if !errors.Is(err, providers.ErrTransactionNotFound) {
+	candidates, err := s.router.Candidates(s.gateways, s.mock, req)
+	if err != nil {
+		if prev, perr := s.previous(ctx, req.TxRef); perr == nil {
+			return prev, nil
+		}
 		return providers.CheckoutResult{}, err
 	}
-	candidates, err := s.router.Candidates(s.gateways, s.mock, req)
+	now := s.now()
+	claimed, err := s.store.ClaimAttempt(s.store.DB(ctx), &store.Transaction{
+		TxRef: req.TxRef, Provider: candidates[0].Name(), Method: req.Method, Amount: req.Amount, Currency: req.Currency,
+		Status: store.StatusInitiating, ReturnURL: req.ReturnURL, CreatedAt: now, UpdatedAt: now,
+	})
 	if err != nil {
 		return providers.CheckoutResult{}, err
 	}
-	var (
-		g       gateway.Gateway
-		res     providers.CheckoutResult
-		lastErr error
-	)
-	for _, cand := range candidates {
-		res, lastErr = cand.Initiate(ctx, req, s.callbackBase+"/providers/"+cand.Name()+"/callback")
-		if lastErr == nil {
+	if !claimed {
+		return s.previous(ctx, req.TxRef) // already sent (or being sent): never send twice
+	}
+	var lastErr error
+	for i, cand := range candidates {
+		if i > 0 {
+			if err := s.store.SwitchAttempt(s.store.DB(ctx), req.TxRef, cand.Name(), s.now()); err != nil {
+				return providers.CheckoutResult{}, err
+			}
+		}
+		started := time.Now()
+		res, err := cand.Initiate(ctx, req, s.callbackBase+"/providers/"+cand.Name()+"/callback")
+		observe(cand.Name(), "initiate", started, err)
+		if err == nil {
 			s.router.Success(cand.Name())
-			g = cand
-			break
+			res.Provider = cand.Name()
+			// Background context: the provider has the request now; recording
+			// its answer must not be lost because the caller gave up.
+			if err := s.store.CompleteAttempt(s.store.DB(context.WithoutCancel(ctx)), req.TxRef, res.ProviderRef,
+				res.CheckoutURL, s.now()); err != nil {
+				s.log.Error("save checkout", "tx_ref", req.TxRef, "err", err)
+			}
+			return res, nil
 		}
-		if !Retryable(lastErr) {
-			return providers.CheckoutResult{}, lastErr
+		lastErr = err
+		if !Retryable(err) {
+			if NotSent(err) {
+				_ = s.store.DropAttempt(s.store.DB(ctx), req.TxRef) // a business refusal: nothing was started
+				return providers.CheckoutResult{}, err
+			}
+			// Maybe received: keep the "initiating" record and let the status checks find out.
+			s.router.Failure(cand.Name(), err)
+			s.log.Warn("provider outcome unknown; not retrying elsewhere", "provider", cand.Name(),
+				"tx_ref", req.TxRef, "err", err)
+			return providers.CheckoutResult{Provider: cand.Name(), OutcomeUnknown: true}, nil
 		}
-		s.router.Failure(cand.Name(), lastErr)
+		s.router.Failure(cand.Name(), err)
 		s.log.Warn("provider unavailable, trying next", "provider", cand.Name(), "method", req.Method,
-			"tx_ref", req.TxRef, "err", lastErr)
+			"tx_ref", req.TxRef, "err", err)
 	}
-	if g == nil {
-		return providers.CheckoutResult{}, providers.ErrProviderUnavailable.WithMessage(
-			"every provider for " + req.Method + " is unavailable: " + lastErr.Error())
+	_ = s.store.DropAttempt(s.store.DB(ctx), req.TxRef)
+	return providers.CheckoutResult{}, providers.ErrProviderUnavailable.WithMessage(
+		"every provider for " + req.Method + " is unavailable: " + lastErr.Error())
+}
+
+// previous returns the stored result of an earlier attempt for txRef.
+func (s *Service) previous(ctx context.Context, txRef string) (providers.CheckoutResult, error) {
+	t, err := s.store.GetTransaction(s.store.DB(ctx), txRef, false)
+	if err != nil {
+		return providers.CheckoutResult{}, err
 	}
-	res.Provider = g.Name()
-	now := s.now()
-	err = s.store.CreateTransaction(s.store.DB(ctx), &store.Transaction{
-		TxRef: req.TxRef, Provider: g.Name(), Method: req.Method, ProviderRef: res.ProviderRef, Amount: req.Amount,
-		Currency: req.Currency, Status: providers.StatusPending, CheckoutURL: res.CheckoutURL,
-		ReturnURL: req.ReturnURL, CreatedAt: now, UpdatedAt: now,
-	})
-	if errors.Is(err, gorm.ErrDuplicatedKey) {
-		return res, nil
-	}
-	return res, err
+	return providers.CheckoutResult{CheckoutURL: t.CheckoutURL, ProviderRef: t.ProviderRef, Provider: t.Provider,
+		OutcomeUnknown: t.Status == store.StatusInitiating}, nil
 }
 
 func (s *Service) VerifyTransaction(ctx context.Context, provider, txRef string) (providers.Transaction, error) {
+	if provider == "" { // the caller does not know where it was routed: use our record
+		t, err := s.store.GetTransaction(s.store.DB(ctx), txRef, false)
+		if err != nil {
+			return providers.Transaction{}, err
+		}
+		provider = t.Provider
+	}
 	g, err := s.gateway(provider)
 	if err != nil {
 		return providers.Transaction{}, err
 	}
-	return g.Verify(ctx, txRef)
+	started := time.Now()
+	t, err := g.Verify(ctx, txRef)
+	observe(g.Name(), "verify", started, err)
+	return t, err
+}
+
+var (
+	providerCalls    = metrics.Counter("paygate_provider_requests_total", "Calls to payment providers", "provider", "operation", "outcome")
+	providerDuration = metrics.Histogram("paygate_provider_request_duration_seconds", "Provider call latency", metrics.DefBuckets, "provider", "operation")
+)
+
+// observe records a provider call: outcome ok, unavailable (down), unknown
+// (no answer) or error (refused / business error).
+func observe(provider, op string, started time.Time, err error) {
+	outcome := "ok"
+	switch {
+	case err == nil:
+	case Retryable(err):
+		outcome = "unavailable"
+	case NotSent(err):
+		outcome = "error"
+	default:
+		outcome = "unknown"
+	}
+	providerCalls.Inc(provider, op, outcome)
+	providerDuration.Since(started, provider, op)
 }
 
 // Refund is idempotent per refund_ref: a retried call returns the stored result.
@@ -113,7 +178,9 @@ func (s *Service) Refund(ctx context.Context, req providers.Refund) (providers.R
 	} else if prev != nil {
 		return providers.RefundResult{Status: prev.Status, ProviderRefundRef: prev.ProviderRefundRef, FailureReason: prev.FailureReason}, nil
 	}
+	started := time.Now()
 	res, err := g.Refund(ctx, req)
+	observe(g.Name(), "refund", started, err)
 	if err != nil {
 		return providers.RefundResult{}, err
 	}

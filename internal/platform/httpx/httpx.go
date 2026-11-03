@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"paygate/internal/platform/apperror"
+	"paygate/internal/platform/metrics"
 	"paygate/internal/platform/reqctx"
 )
 
@@ -105,12 +107,24 @@ func AccessLog(log *slog.Logger) func(http.Handler) http.Handler {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 			next.ServeHTTP(ww, r)
+			route := "unmatched"
+			if rc := chi.RouteContext(r.Context()); rc != nil && rc.RoutePattern() != "" {
+				route = rc.RoutePattern() // the pattern, never the raw path: ids would explode the series
+			}
+			status := strconv.Itoa(ww.Status())
+			httpRequests.Inc(r.Method, route, status)
+			httpDuration.Since(start, r.Method, route)
 			log.Info("http",
 				"method", r.Method, "path", r.URL.Path, "status", ww.Status(),
 				"ms", time.Since(start).Milliseconds(), "correlation_id", reqctx.CorrelationID(r.Context()))
 		})
 	}
 }
+
+var (
+	httpRequests = metrics.Counter("paygate_http_requests_total", "HTTP requests by route and status", "method", "route", "status")
+	httpDuration = metrics.Histogram("paygate_http_request_duration_seconds", "HTTP request latency", metrics.DefBuckets, "method", "route")
+)
 
 // IsNotFound is a small helper for handlers that branch on missing records.
 func IsNotFound(err error) bool {

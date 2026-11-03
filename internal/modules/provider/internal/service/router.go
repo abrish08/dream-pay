@@ -93,14 +93,31 @@ func (r *Router) Candidates(gws map[string]gateway.Gateway, mock gateway.Gateway
 	return out, nil
 }
 
-// Retryable: only "the provider is down" errors fail over. A decline or a
-// validation error from one provider would come back from the next one too.
+// Retryable: fail over only when the provider certainly did NOT receive the
+// request (ErrProviderUnavailable and other "unavailable" errors except
+// "outcome unknown"). A decline would come back from the next provider too,
+// and a request that may have arrived must never be sent twice.
 func Retryable(err error) bool {
 	var ae *apperror.Error
 	if !errors.As(err, &ae) {
-		return true // network / unexpected error
+		return false // unexpected error: the request may have been sent
 	}
-	return ae.Kind == apperror.KindUnavailable || ae.Kind == apperror.KindInternal
+	return ae.Kind == apperror.KindUnavailable && ae.Code != providers.ErrOutcomeUnknown.Code
+}
+
+// NotSent: the error proves no checkout was started (a business refusal such
+// as an invalid amount or unsupported currency), so the attempt can be
+// dropped and the payment failed.
+func NotSent(err error) bool {
+	var ae *apperror.Error
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch ae.Kind {
+	case apperror.KindInvalid, apperror.KindUnprocessable, apperror.KindForbidden, apperror.KindConflict, apperror.KindNotFound:
+		return true
+	}
+	return false
 }
 
 func (r *Router) Success(provider string) {

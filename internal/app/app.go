@@ -17,6 +17,7 @@ import (
 	"paygate/internal/app/apidocs"
 	authc "paygate/internal/contracts/auth"
 	"paygate/internal/modules/auth"
+	"paygate/internal/modules/dispute"
 	"paygate/internal/modules/kyc"
 	"paygate/internal/modules/ledger"
 	"paygate/internal/modules/merchant"
@@ -25,6 +26,7 @@ import (
 	"paygate/internal/modules/provider"
 	"paygate/internal/modules/reconciliation"
 	"paygate/internal/modules/refund"
+	"paygate/internal/modules/risk"
 	"paygate/internal/modules/webhook"
 	"paygate/internal/platform/apperror"
 	"paygate/internal/platform/authn"
@@ -33,6 +35,7 @@ import (
 	"paygate/internal/platform/database"
 	"paygate/internal/platform/httpx"
 	"paygate/internal/platform/mail"
+	"paygate/internal/platform/metrics"
 	"paygate/internal/platform/module"
 	"paygate/internal/platform/secrets"
 	"paygate/internal/platform/sms"
@@ -41,7 +44,7 @@ import (
 // Modules is the list of every module in the system.
 var Modules = []string{
 	merchant.Name, auth.Name, provider.Name, payment.Name,
-	refund.Name, ledger.Name, webhook.Name, reconciliation.Name, payout.Name, kyc.Name,
+	refund.Name, ledger.Name, webhook.Name, reconciliation.Name, payout.Name, kyc.Name, risk.Name, dispute.Name,
 }
 
 type App struct {
@@ -140,11 +143,12 @@ func (a *App) newModule(name string) (module.Module, error) {
 			MPGS: conv(cfg.MPGS), MPGSTest: conv(cfg.MPGSTest)})
 	case payment.Name:
 		return payment.New(payment.Deps{DB: db, Bus: b, Log: log, AllowMockInLive: cfg.AllowMockInLive,
-			PaymentTTL: cfg.PaymentTTL, ExpiryEvery: cfg.PaymentExpiryEvery, PublicBaseURL: cfg.PublicBaseURL}), nil
+			PaymentTTL: cfg.PaymentTTL, ExpiryEvery: cfg.PaymentExpiryEvery, PublicBaseURL: cfg.PublicBaseURL,
+			CheckEvery: cfg.PaymentCheckEvery, CheckSchedule: cfg.PaymentCheckSchedule}), nil
 	case refund.Name:
 		return refund.New(refund.Deps{DB: db, Bus: b, Log: log}), nil
 	case ledger.Name:
-		return ledger.New(ledger.Deps{DB: db, Bus: b, Log: log}), nil
+		return ledger.New(ledger.Deps{DB: db, Bus: b, Log: log, ReleaseEvery: cfg.ReserveReleaseEvery}), nil
 	case webhook.Name:
 		return webhook.New(webhook.Deps{DB: db, Bus: b, Log: log, EncryptionKey: cfg.EncryptionKey, AllowInsecure: cfg.AllowInsecureWebhooks})
 	case kyc.Name:
@@ -156,10 +160,17 @@ func (a *App) newModule(name string) (module.Module, error) {
 				SecretKey: mc.SecretKey, Bucket: mc.Bucket, Region: mc.Region, UseSSL: mc.UseSSL, PublicUseSSL: mc.PublicUseSSL, SSE: mc.SSE},
 			FaydaIssuer: cfg.FaydaIssuer, FaydaClientID: cfg.FaydaClientID, FaydaPrivateKey: cfg.FaydaPrivateKey,
 			FaydaRedirectURI: cfg.FaydaRedirectURI, FaydaACR: cfg.FaydaACR})
+	case dispute.Name:
+		return dispute.New(dispute.Deps{DB: db, Bus: b, Log: log, DeadlineEvery: cfg.DisputeDeadlineEvery}), nil
+	case risk.Name:
+		return risk.New(risk.Deps{DB: db, Bus: b, Log: log}), nil
 	case payout.Name:
-		return payout.New(payout.Deps{DB: db, Bus: b, Log: log}), nil
+		return payout.New(payout.Deps{DB: db, Bus: b, Log: log, ScheduleEvery: cfg.PayoutScheduleEvery,
+			Timezone: cfg.ReconciliationTimezone}), nil
 	case reconciliation.Name:
-		return reconciliation.New(reconciliation.Deps{DB: db, Bus: b, Log: log}), nil
+		return reconciliation.New(reconciliation.Deps{DB: db, Bus: b, Log: log,
+			Timezone: cfg.ReconciliationTimezone, DailyAfter: cfg.ReconciliationDailyAfter,
+			SettleWait: cfg.ReconciliationSettleWait})
 	}
 	return nil, fmt.Errorf("unknown module")
 }
@@ -238,6 +249,7 @@ func (a *App) buildRouter() chi.Router {
 	}
 	r.NotFound(notFound)
 	r.MethodNotAllowed(notFound)
+	r.Method(http.MethodGet, "/metrics", metrics.Handler(a.cfg.MetricsToken)) // Prometheus; METRICS_TOKEN protects it
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{
 			"status": "ok", "bus": a.cfg.Bus, "modules": a.ModuleNames(), "handles": a.bus.Routes(),

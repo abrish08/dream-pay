@@ -105,3 +105,43 @@ func (s *Store) ListForMerchant(q *gorm.DB, merchantID, environment, paymentID, 
 func (s *Store) LockPayment(q *gorm.DB, paymentID string) error {
 	return q.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "refund:"+paymentID).Error
 }
+
+// GetByIDs returns the refunds with these ids (invalid ids are skipped).
+func (s *Store) GetByIDs(q *gorm.DB, ids []string) ([]domain.Refund, error) {
+	valid := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, err := uuid.Parse(id); err == nil {
+			valid = append(valid, id)
+		}
+	}
+	var out []domain.Refund
+	if len(valid) == 0 {
+		return out, nil
+	}
+	return out, q.Table(table).Where("id IN ?", valid).Find(&out).Error
+}
+
+// List: refunds by status, provider and creation time, ordered by id.
+func (s *Store) List(q *gorm.DB, statuses []string, provider string, from, to time.Time, afterID string, limit int) ([]domain.Refund, error) {
+	q = q.Table(table)
+	if len(statuses) > 0 {
+		q = q.Where("status IN ?", statuses)
+	}
+	if provider != "" {
+		q = q.Where("provider = ?", provider)
+	}
+	if !from.IsZero() {
+		q = q.Where("created_at >= ?", from)
+	}
+	if !to.IsZero() {
+		q = q.Where("created_at < ?", to)
+	}
+	if afterID != "" {
+		q = q.Where("id > ?", afterID)
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	var out []domain.Refund
+	return out, q.Order("id").Limit(limit).Find(&out).Error
+}

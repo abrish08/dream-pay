@@ -38,3 +38,39 @@ type Reservation struct {
 }
 
 func (ReserveFunds) Route() string { return "ledger.reserve_funds" }
+
+// GetPostings returns the postings with these references (e.g.
+// "payment:<id>:captured"); missing references are left out. At most 500.
+// Used by reconciliation to prove every captured payment was booked.
+type GetPostings struct {
+	bus.Returns[[]PostingInfo]
+	References []string `json:"references"`
+}
+
+type PostingInfo struct {
+	Reference string `json:"reference"`
+	Currency  string `json:"currency"`
+	Amount    int64  `json:"amount"` // total of the posting's debit lines
+}
+
+func (GetPostings) Route() string { return "ledger.get_postings" }
+
+// PaymentReference is the ledger reference of a captured payment.
+func PaymentReference(paymentID string) string { return "payment:" + paymentID + ":captured" }
+
+// GetBalance returns a merchant's balances (scheduled payouts).
+type GetBalance struct {
+	bus.Returns[Balance]
+	MerchantID  string `json:"merchant_id"`
+	Environment string `json:"environment"`
+	Currency    string `json:"currency"`
+}
+
+type Balance struct {
+	Available      int64 `json:"available"`       // can be paid out
+	Reserved       int64 `json:"reserved"`        // rolling reserve, released on schedule
+	DisputeHold    int64 `json:"dispute_hold"`    // held for open disputes
+	PendingPayouts int64 `json:"pending_payouts"` // held for payouts not sent yet
+}
+
+func (GetBalance) Route() string { return "ledger.get_balance" }

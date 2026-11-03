@@ -83,7 +83,7 @@ Content-Type: application/json
 | `reference` | yes | your order id (max 100 characters) |
 | `payment_method` | no | `telebirr`, `cbe_birr`, `mpesa`, `card`, `bank_transfer`. Leave it out to let the customer choose on paygate's page |
 | `return_url` | no | where the customer goes after paying |
-| `customer` | no | `email`, `name` |
+| `customer` | no | `email`, `name`, `phone`, `ip` (the customer's IP as your server saw it). Send what you have: fraud checks use them |
 | `description` | no | shown to the customer |
 | `metadata` | no | your own key/values (strings), returned in webhooks |
 | `expires_in_minutes` | no | 5 to 1440, default 30 |
@@ -125,6 +125,7 @@ paygate sends a `POST` to your endpoint when something happens:
 | `payment.expired` | not paid in time |
 | `refund.succeeded`, `refund.failed` | a refund finished |
 | `payout.paid`, `payout.failed` | a payout to your bank finished |
+| `dispute.opened`, `dispute.closed` | a cardholder disputed a payment / the dispute was decided (respond in the dashboard before `evidence_due_by`) |
 
 ```http
 POST https://shop.example/webhooks/paygate
@@ -180,6 +181,8 @@ Every error has the same shape:
 | 404 | `not_found` | `payment_not_found` | — |
 | 409 | `conflict` | `idempotency_key_reused` | use a new key for a different request |
 | 422 | `unprocessable` | `payment_method_unavailable`, `refund_exceeds_payment` | offer another method / smaller amount |
+| 422 | `unprocessable` | `risk_declined` | the payment was declined by fraud checks; do not retry it as is |
+| 422 | `unprocessable` | `limit_exceeded` | above your account's limits; ask us to raise them |
 | 429 | `too_many_requests` | `rate_limited` | retry after a short wait |
 | 5xx | `internal`, `unavailable` | — | retry with the **same** Idempotency-Key |
 
@@ -191,6 +194,7 @@ The libraries on the language pages already retry network errors, `429` and
 | Call | Use |
 |---|---|
 | `GET /v1/payments/{id}` | current status (e.g. if a webhook was missed) |
+| `GET /v1/payments/{id}/events` | the payment's full history: every status change, who caused it and why |
 | `GET /v1/payments?reference=ORDER-1001&status=succeeded&limit=20` | search; page with `starting_after=<last id>` while `has_more` is true |
 | `POST /v1/refunds` `{"payment_id", "amount"?, "reason"?}` | refund all (no amount) or part |
 | `GET /v1/balance?currency=USD` | what you have earned (after fees) |
@@ -213,7 +217,15 @@ account, card payments in test mode open the card network's test page:
 | 3-D Secure code | `123456` | other codes fail with `authentication_failed` |
 
 Other methods (telebirr, CBE Birr, ...) show a test page with **Pay** and
-**Decline** buttons.
+**Decline** buttons. Two test amounts simulate provider trouble:
+
+| Amount ends in | Simulates | You see |
+|---|---|---|
+| `…9.99` (e.g. `20999`) | the provider got the request but did not answer | `201`, status `processing`, no `checkout_url`; the result arrives by webhook once confirmed |
+| `…9.98` (e.g. `10998`) | the provider is unreachable | `502 provider_unavailable`; the payment is `failed` |
+
+Handle the first case like a real telebirr push: show "waiting for
+confirmation" and wait for the webhook. **Never** treat `processing` as failed.
 
 ## Going live checklist
 

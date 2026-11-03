@@ -3,6 +3,7 @@ package domain
 import (
 	"testing"
 
+	"paygate/internal/contracts/disputes"
 	"paygate/internal/contracts/payments"
 	"paygate/internal/contracts/refunds"
 )
@@ -50,5 +51,36 @@ func TestUnbalancedRejected(t *testing.T) {
 func TestTestAndLiveMoneyNeverMix(t *testing.T) {
 	if MerchantAvailable("m1", "test") == MerchantAvailable("m1", "live") {
 		t.Fatal("test and live balances must use different accounts")
+	}
+}
+
+func TestReserveAndDisputePostingsBalance(t *testing.T) {
+	captured := PaymentCaptured(payments.PaymentSucceeded{PaymentID: "p", MerchantID: "m", Environment: "live", Amount: 100000,
+		Fee: 1500, Reserve: 9850, ReserveDays: 7, Currency: "ETB", Provider: "telebirr"})
+	if err := captured.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	var reserved, available int64
+	for _, l := range captured.Lines {
+		switch l.Account {
+		case MerchantReserve("m", "live"):
+			reserved += l.Credit
+		case MerchantAvailable("m", "live"):
+			available += l.Credit
+		}
+	}
+	if reserved != 9850 || available != 88650 {
+		t.Fatalf("reserve split: reserved %d available %d", reserved, available)
+	}
+	for _, p := range []Posting{
+		ReserveReleased("p", "m", "live", "ETB", 9850),
+		DisputeOpened(disputes.DisputeOpened{DisputeID: "d", PaymentID: "p", MerchantID: "m", Environment: "live", Amount: 20000, Currency: "ETB"}),
+		DisputeClosed(disputes.DisputeClosed{DisputeID: "d", MerchantID: "m", Environment: "live", Amount: 20000, Currency: "ETB", Outcome: "won"}),
+		DisputeClosed(disputes.DisputeClosed{DisputeID: "d2", MerchantID: "m", Environment: "live", Amount: 20000, Currency: "ETB",
+			Provider: "telebirr", Outcome: "lost", Fee: 1500}),
+	} {
+		if err := p.Validate(); err != nil {
+			t.Errorf("%s: %v", p.Reference, err)
+		}
 	}
 }

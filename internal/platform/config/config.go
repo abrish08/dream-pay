@@ -108,6 +108,19 @@ type Config struct {
 
 	PaymentTTL         time.Duration
 	PaymentExpiryEvery time.Duration // how often overdue payments are checked (default 15s)
+	// Status checks of open payments with the provider (tests shorten them).
+	PaymentCheckEvery    time.Duration
+	PaymentCheckSchedule []time.Duration
+	// Daily reconciliation: business-day timezone and start delay after midnight.
+	ReconciliationTimezone   string
+	ReconciliationDailyAfter time.Duration
+	ReconciliationSettleWait time.Duration // tests only: how recent a capture may be before its ledger posting is checked
+	// MetricsToken: if set, /metrics requires "Authorization: Bearer <token>".
+	MetricsToken string
+	// Workers (tests shorten them): reserve release, scheduled payouts, overdue disputes.
+	ReserveReleaseEvery  time.Duration
+	PayoutScheduleEvery  time.Duration
+	DisputeDeadlineEvery time.Duration
 }
 
 func Load() (Config, error) {
@@ -231,6 +244,15 @@ func Load() (Config, error) {
 		c.PaymentTTL = d
 	}
 
+	c.MetricsToken = os.Getenv("METRICS_TOKEN")
+	c.ReconciliationTimezone = env("RECONCILIATION_TIMEZONE", "Africa/Addis_Ababa")
+	if v := os.Getenv("RECONCILIATION_DAILY_AFTER"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 || d > 12*time.Hour {
+			return c, fmt.Errorf("RECONCILIATION_DAILY_AFTER must be a duration between 0 and 12h")
+		}
+		c.ReconciliationDailyAfter = d
+	}
 	c.PaymentExpiryEvery = 15 * time.Second
 	if v := os.Getenv("PAYMENT_EXPIRY_CHECK_EVERY"); v != "" {
 		d, err := time.ParseDuration(v)

@@ -28,7 +28,7 @@ func NewHTTP(svc *service.Service, log *slog.Logger) *HTTP { return &HTTP{svc: s
 //	GET   /admin/merchants?status=pending  list, newest first (limit, starting_after)
 //	GET   /admin/merchants/{id}
 //	POST  /admin/merchants/{id}/status     {status: active|suspended}  approve / suspend / reject
-//	PATCH /admin/merchants/{id}            {fee_bps}
+//	PATCH /admin/merchants/{id}            {fee_bps?, settings?}  settings: risk limits, reserve, payout schedule
 func (h *HTTP) RegisterAdmin(r chi.Router) {
 	r.With(httpx.Require(merchants.PermManage, h.log)).Post("/merchants", h.create)
 	r.With(httpx.Require(merchants.PermRead, h.log)).Get("/merchants", h.list)
@@ -74,17 +74,30 @@ func (h *HTTP) list(w http.ResponseWriter, r *http.Request) {
 
 func (h *HTTP) update(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		FeeBPS *int64 `json:"fee_bps"`
+		FeeBPS   *int64              `json:"fee_bps"`
+		Settings *merchants.Settings `json:"settings"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.WriteError(w, r, h.log, err)
 		return
 	}
-	if body.FeeBPS == nil {
-		h.respond(w, r, 0, nil, apperror.Invalid("nothing_to_update", "send fee_bps"))
+	if body.FeeBPS == nil && body.Settings == nil {
+		h.respond(w, r, 0, nil, apperror.Invalid("nothing_to_update", "send fee_bps and/or settings"))
 		return
 	}
-	m, err := h.svc.SetFee(r.Context(), chi.URLParam(r, "id"), *body.FeeBPS)
+	var (
+		m   merchants.Merchant
+		err error
+	)
+	if body.FeeBPS != nil {
+		if m, err = h.svc.SetFee(r.Context(), chi.URLParam(r, "id"), *body.FeeBPS); err != nil {
+			h.respond(w, r, 0, nil, err)
+			return
+		}
+	}
+	if body.Settings != nil {
+		m, err = h.svc.SetSettings(r.Context(), chi.URLParam(r, "id"), *body.Settings)
+	}
 	h.respond(w, r, http.StatusOK, m, err)
 }
 
@@ -126,6 +139,7 @@ func RegisterBus(b bus.Bus, svc *service.Service) {
 	bus.Handle(b, func(ctx context.Context, q merchants.GetMerchant) (merchants.Merchant, error) {
 		return svc.GetMerchant(ctx, q.ID)
 	})
+	bus.Handle(b, svc.PayoutSchedules)
 	bus.Handle(b, func(ctx context.Context, q merchants.CreateMerchant) (merchants.Merchant, error) {
 		return svc.Create(ctx, domain.NewMerchantInput{Name: q.Name, Email: q.Email, Phone: q.Phone,
 			Website: q.Website, FeeBPS: domain.DefaultFeeBPS, Status: merchants.StatusPending})

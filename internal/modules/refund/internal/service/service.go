@@ -237,3 +237,27 @@ func view(r *domain.Refund) View {
 		Reason: r.Reason, ProviderRefundRef: r.ProviderRefundRef, FailureReason: r.FailureReason,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
 }
+
+func toContract(rs []domain.Refund) []refunds.Refund {
+	out := make([]refunds.Refund, len(rs))
+	for i, r := range rs {
+		out[i] = refunds.Refund{ID: r.ID, PaymentID: r.PaymentID, MerchantID: r.MerchantID, Environment: r.Environment,
+			Provider: r.Provider, Amount: r.Amount, Currency: r.Currency, Status: r.Status, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
+	}
+	return out
+}
+
+// GetByIDs answers refunds.GetRefundsByID.
+func (s *Service) GetByIDs(ctx context.Context, q refunds.GetRefundsByID) ([]refunds.Refund, error) {
+	if len(q.IDs) > 500 {
+		return nil, apperror.Invalid("too_many_ids", "at most 500 ids per request")
+	}
+	rs, err := s.store.GetByIDs(s.db.WithContext(ctx), q.IDs)
+	return toContract(rs), err
+}
+
+// ListAll answers refunds.ListRefunds.
+func (s *Service) ListAll(ctx context.Context, q refunds.ListRefunds) ([]refunds.Refund, error) {
+	rs, err := s.store.List(s.db.WithContext(ctx), q.Statuses, q.Provider, q.CreatedFrom, q.CreatedTo, q.AfterID, q.Limit)
+	return toContract(rs), err
+}

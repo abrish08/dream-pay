@@ -52,8 +52,14 @@ func ValidMethod(m string) bool {
 var (
 	ErrUnknownProvider     = apperror.Invalid("unknown_provider", "unknown payment provider")
 	ErrTransactionNotFound = apperror.NotFound("provider_transaction_not_found", "transaction not found at provider")
+	// ErrProviderUnavailable: the request certainly did NOT reach the provider
+	// (connection refused, circuit open, 5xx before acceptance). Safe to fail
+	// over to another provider or to fail the payment.
 	ErrProviderUnavailable = apperror.Unavailable("provider_unavailable", "payment provider is unavailable")
-	ErrMethodUnavailable   = apperror.Unprocessable("payment_method_unavailable",
+	// ErrOutcomeUnknown: the request may have reached the provider (timeout,
+	// connection lost after sending). Never retry elsewhere: ask the provider.
+	ErrOutcomeUnknown    = apperror.Unavailable("provider_outcome_unknown", "the provider did not confirm the request in time")
+	ErrMethodUnavailable = apperror.Unprocessable("payment_method_unavailable",
 		"this payment method is not available right now")
 )
 
@@ -61,6 +67,11 @@ type CheckoutResult struct {
 	CheckoutURL string `json:"checkout_url"`
 	ProviderRef string `json:"provider_ref"`
 	Provider    string `json:"provider"` // the provider the method was routed to
+	// OutcomeUnknown: the request may have reached the provider (e.g. a
+	// timeout after sending a USSD push), so it was NOT retried or sent
+	// elsewhere. The payment stays open and its status is checked with the
+	// provider until it is known. Never treat this as a failure.
+	OutcomeUnknown bool `json:"outcome_unknown,omitempty"`
 }
 
 type Transaction struct {
@@ -117,6 +128,8 @@ type MethodInfo struct {
 func (ListMethods) Route() string { return "providers.list_methods" }
 
 // VerifyTransaction asks the provider directly (never trust callbacks alone).
+// Provider may be empty: the provider module then uses the provider it
+// recorded for TxRef.
 type VerifyTransaction struct {
 	bus.Returns[Transaction]
 	Provider string `json:"provider"`

@@ -41,9 +41,12 @@ type Payment struct {
 	Metadata       map[string]string `json:"metadata"`
 	CustomerEmail  string            `json:"customer_email,omitempty"`
 	CustomerName   string            `json:"customer_name,omitempty"`
+	CustomerPhone  string            `json:"customer_phone,omitempty"`
 	ReturnURL      string            `json:"return_url,omitempty"`
 	CheckoutURL    string            `json:"checkout_url,omitempty"`
 	FailureReason  string            `json:"failure_reason,omitempty"`
+	Reserve        int64             `json:"reserve,omitempty"` // held for ReserveDays after capture
+	ReserveDays    int               `json:"reserve_days,omitempty"`
 	ExpiresAt      time.Time         `json:"expires_at"`
 	CreatedAt      time.Time         `json:"created_at"`
 	UpdatedAt      time.Time         `json:"updated_at"`
@@ -64,6 +67,7 @@ func (GetPayment) Route() string { return "payments.get" }
 type ListPayments struct {
 	bus.Returns[[]Payment]
 	Statuses    []string  `json:"statuses"`
+	Provider    string    `json:"provider,omitempty"` // only payments routed to this provider
 	CreatedFrom time.Time `json:"created_from"`
 	CreatedTo   time.Time `json:"created_to"`
 	AfterID     string    `json:"after_id"` // cursor: results are ordered by id
@@ -71,6 +75,29 @@ type ListPayments struct {
 }
 
 func (ListPayments) Route() string { return "payments.list" }
+
+// GetPaymentsByID returns the payments with these ids (unknown ids are left
+// out). At most 500 per request. Used by reconciliation to match settlement
+// files.
+type GetPaymentsByID struct {
+	bus.Returns[[]Payment]
+	IDs []string `json:"ids"`
+}
+
+func (GetPaymentsByID) Route() string { return "payments.get_by_ids" }
+
+// SyncPayment asks the provider for the payment's real status now and
+// applies it (e.g. reconciliation found the customer was charged but the
+// payment is not marked succeeded). Recorded in the payment's history with
+// Source.
+type SyncPayment struct {
+	bus.Returns[Payment]
+	PaymentID string `json:"payment_id"`
+	Source    string `json:"source"` // who asked, e.g. "reconciliation"
+	Note      string `json:"note,omitempty"`
+}
+
+func (SyncPayment) Route() string { return "payments.sync" }
 
 // ---- Events ----
 
@@ -86,6 +113,8 @@ type PaymentSucceeded struct {
 	Environment string            `json:"environment"`
 	Amount      int64             `json:"amount"`
 	Fee         int64             `json:"fee"`
+	Reserve     int64             `json:"reserve,omitempty"`      // part of the merchant's share held...
+	ReserveDays int               `json:"reserve_days,omitempty"` // ...for this many days
 	Currency    string            `json:"currency"`
 	Provider    string            `json:"provider"`
 	ProviderRef string            `json:"provider_ref"`

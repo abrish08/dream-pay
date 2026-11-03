@@ -3,6 +3,8 @@ package payout
 
 import (
 	"log/slog"
+	"time"
+	_ "time/tzdata"
 
 	"gorm.io/gorm"
 
@@ -21,6 +23,9 @@ type Deps struct {
 	DB  *gorm.DB
 	Bus bus.Bus
 	Log *slog.Logger
+	// Scheduled payouts: how often they are checked and the business day's timezone.
+	ScheduleEvery time.Duration
+	Timezone      string
 }
 
 type Module struct {
@@ -35,7 +40,14 @@ func New(d Deps) *Module {
 	base.Models(store.Models()...) // schema from GORM models, auto-migrated (additive only)
 	base.AddStartTask("register permissions", authc.RegisterTask(d.Bus, Name, payouts.Permissions))
 	svc := service.New(d.DB, base.Events, d.Bus, base.Log)
+	svc.ScheduleEvery = d.ScheduleEvery
+	if d.Timezone != "" {
+		if loc, err := time.LoadLocation(d.Timezone); err == nil {
+			svc.Location = loc
+		}
+	}
 	base.AddWorker(svc.Worker)
+	base.AddWorker(svc.ScheduleWorker)
 	return &Module{Base: base, svc: svc}
 }
 
@@ -45,6 +57,6 @@ func (m *Module) RegisterRoutes(r module.Routers) {
 	h.RegisterAdmin(r.Admin)
 }
 
-// Asks:      merchants.GetMerchant, ledger.ReserveFunds
+// Asks:      merchants.GetMerchant, merchants.ListPayoutSchedules, ledger.ReserveFunds, ledger.GetBalance
 // Publishes: payouts.PayoutPaid, payouts.PayoutFailed
 func (m *Module) RegisterHandlers(bus.Bus) {}

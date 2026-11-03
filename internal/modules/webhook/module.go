@@ -13,6 +13,7 @@ import (
 	"paygate/internal/modules/webhook/internal/service"
 	"paygate/internal/modules/webhook/internal/transport"
 	"paygate/internal/platform/bus"
+	"paygate/internal/platform/metrics"
 	"paygate/internal/platform/module"
 	"paygate/internal/platform/secrets"
 )
@@ -38,6 +39,8 @@ type Module struct {
 var _ module.Module = (*Module)(nil)
 
 func New(d Deps) (*Module, error) {
+	metrics.SQLGauge("paygate_webhook_deliveries", "Webhook deliveries waiting or given up (failed after all retries)", nil, d.DB,
+		`SELECT status, COUNT(*) AS n FROM webhook_deliveries WHERE status IN ('pending', 'failed') GROUP BY status`, "status")
 	box, err := secrets.NewBox(d.EncryptionKey)
 	if err != nil {
 		return nil, err

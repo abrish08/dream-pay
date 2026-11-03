@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"paygate/internal/contracts/disputes"
 	"paygate/internal/contracts/payments"
 	"paygate/internal/contracts/payouts"
 	"paygate/internal/contracts/refunds"
@@ -25,6 +26,8 @@ var PublicEventTypes = map[string]string{
 	refunds.TopicRefundFailed:      "refund.failed",
 	payouts.TopicPayoutPaid:        "payout.paid",
 	payouts.TopicPayoutFailed:      "payout.failed",
+	disputes.TopicDisputeOpened:    "dispute.opened",
+	disputes.TopicDisputeClosed:    "dispute.closed",
 }
 
 const MaxAttempts = 8

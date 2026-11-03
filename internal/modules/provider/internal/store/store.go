@@ -72,6 +72,39 @@ func (s *Store) GetTransaction(q *gorm.DB, txRef string, forUpdate bool) (*Trans
 
 func (s *Store) CreateTransaction(q *gorm.DB, t *Transaction) error { return q.Create(t).Error }
 
+// StatusInitiating marks a checkout whose request is being sent (or whose
+// answer never came back). It is written BEFORE calling the provider, so a
+// crash or timeout leaves a record to verify instead of a lost payment.
+const StatusInitiating = "initiating"
+
+// ClaimAttempt records "about to call provider for txRef". It returns false
+// when a record already exists (an earlier or concurrent attempt): the
+// caller must then not send the request again.
+func (s *Store) ClaimAttempt(q *gorm.DB, t *Transaction) (bool, error) {
+	res := q.Clauses(clause.OnConflict{DoNothing: true}).Create(t)
+	return res.RowsAffected == 1, res.Error
+}
+
+// SwitchAttempt moves a still-initiating attempt to the next provider after
+// the previous one certainly did not receive the request (failover).
+func (s *Store) SwitchAttempt(q *gorm.DB, txRef, provider string, now time.Time) error {
+	return q.Model(&Transaction{}).Where("tx_ref = ? AND status = ?", txRef, StatusInitiating).
+		Updates(map[string]any{"provider": provider, "updated_at": now}).Error
+}
+
+// CompleteAttempt stores the provider's answer: the checkout is open.
+func (s *Store) CompleteAttempt(q *gorm.DB, txRef, providerRef, checkoutURL string, now time.Time) error {
+	return q.Model(&Transaction{}).Where("tx_ref = ? AND status = ?", txRef, StatusInitiating).
+		Updates(map[string]any{"provider_ref": providerRef, "checkout_url": checkoutURL,
+			"status": providers.StatusPending, "updated_at": now}).Error
+}
+
+// DropAttempt removes an attempt no provider received (every provider
+// refused before accepting it), so nothing is left to verify.
+func (s *Store) DropAttempt(q *gorm.DB, txRef string) error {
+	return q.Where("tx_ref = ? AND status = ?", txRef, StatusInitiating).Delete(&Transaction{}).Error
+}
+
 func (s *Store) UpdateTransactionStatus(q *gorm.DB, txRef, status string, now time.Time) error {
 	return q.Model(&Transaction{}).Where("tx_ref = ?", txRef).
 		Updates(map[string]any{"status": status, "updated_at": now}).Error
