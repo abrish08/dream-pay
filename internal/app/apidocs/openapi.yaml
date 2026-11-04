@@ -190,7 +190,12 @@ paths:
     post:
       tags: [Auth]
       summary: Start authenticator setup (Microsoft Authenticator, Google Authenticator...)
-      description: Show `otpauth_url` as a QR code (or the `secret` for manual entry), then confirm with the first code.
+      description: |
+        Show `qr_code` (a PNG data URL: `<img src="...">`) for the user to scan, or `secret` for "enter code manually",
+        then confirm with the first code. Every user has their own secret, stored encrypted (AES-256-GCM). The app shows
+        `issuer`: "Paygate - <business name>" for merchant users, "Paygate Admin" for staff. Staff must use MFA on /admin
+        (REQUIRE_STAFF_MFA), merchant users on /v1 (REQUIRE_MERCHANT_MFA) and for payouts (REQUIRE_MFA_FOR_PAYOUTS);
+        sessions signed in before enrolling must sign in again (`403 mfa_required`).
       responses:
         "200":
           description: Setup
@@ -464,6 +469,71 @@ paths:
                   reserved: {type: integer, format: int64, description: Rolling reserve; each part becomes available after reserve_days}
                   dispute_hold: {type: integer, format: int64, description: Held for open disputes}
                   pending_payouts: {type: integer, format: int64, description: Held for payouts not sent yet}
+  /v1/payment-links:
+    post:
+      tags: [Payments]
+      summary: Create a payment link to share (payments:write)
+      description: |
+        Share `url` (chat, SMS, invoice, QR on a counter). Each visit opens a payment on the hosted checkout page, where the
+        customer picks the method. `single_use` (an invoice) closes once paid; visits at the same time get the same payment.
+        Without it the link is reusable (a price tag). Live links need approved KYC.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"amount": 250000, "currency": "ETB", "description": "Invoice 77: 5 bags of coffee", "reference": "INV-77", "single_use": true, "expires_at": "2026-12-01T00:00:00Z"}
+            schema:
+              type: object
+              required: [amount, currency]
+              properties:
+                amount: {type: integer}
+                currency: {type: string, enum: [ETB, USD]}
+                description: {type: string}
+                reference: {type: string, description: "Prefix of each payment's reference"}
+                single_use: {type: boolean}
+                expires_at: {type: string, format: date-time}
+                environment: {type: string, enum: [live, test], description: Dashboard users only}
+      responses:
+        "201": {$ref: "#/components/responses/PaymentLink"}
+        "400": {$ref: "#/components/responses/Error"}
+    get:
+      tags: [Payments]
+      summary: Your payment links, newest first (payments:read)
+      parameters: [{$ref: "#/components/parameters/Limit"}]
+      responses: {"200": {description: Links}}
+  /v1/payment-links/{id}:
+    get:
+      tags: [Payments]
+      summary: A payment link (payments:read)
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      responses: {"200": {$ref: "#/components/responses/PaymentLink"}, "404": {$ref: "#/components/responses/Error"}}
+  /v1/payment-links/{id}/deactivate:
+    post:
+      tags: [Payments]
+      summary: Stop a payment link (payments:write)
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      responses: {"200": {$ref: "#/components/responses/PaymentLink"}, "404": {$ref: "#/components/responses/Error"}}
+  /v1/reports/payments.csv:
+    get:
+      tags: [Payments]
+      summary: Export payments as CSV (payments:read)
+      description: Newest first. Cells that a spreadsheet would run as formulas are neutralised.
+      parameters:
+        - {name: from, in: query, schema: {type: string}, description: "RFC 3339 or YYYY-MM-DD; default 30 days ago"}
+        - {name: to, in: query, schema: {type: string}, description: Default now; at most 93 days after from}
+        - {name: status, in: query, schema: {type: string, example: "succeeded,refunded"}}
+      responses: {"200": {description: CSV file, content: {text/csv: {}}}, "400": {$ref: "#/components/responses/Error"}}
+  /v1/reports/statement.csv:
+    get:
+      tags: [Balance & payouts]
+      summary: Balance statement as CSV (balance:read)
+      description: The opening balance, then every movement of the available balance (payments, refunds, reserve releases, disputes, payouts) with the balance after it.
+      parameters:
+        - {name: currency, in: query, schema: {type: string, default: ETB}}
+        - {name: from, in: query, schema: {type: string}}
+        - {name: to, in: query, schema: {type: string}}
+        - {name: environment, in: query, schema: {type: string, enum: [live, test]}, description: Dashboard users only}
+      responses: {"200": {description: CSV file, content: {text/csv: {}}}, "400": {$ref: "#/components/responses/Error"}}
   /v1/disputes:
     get:
       tags: [Disputes]
@@ -1332,6 +1402,13 @@ paths:
       responses:
         "200": {description: The file, content: {application/pdf: {}, image/jpeg: {}, image/png: {}}}
         "404": {$ref: "#/components/responses/Error"}
+  /l/{id}:
+    get:
+      tags: [Hosted pages & providers]
+      summary: A payment link; opens a payment and redirects to the checkout page
+      security: []
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      responses: {"303": {description: "To /pay/{payment id}"}, "404": {description: Unknown link}, "410": {description: Paid, expired or deactivated}}
   /pay/{id}:
     get:
       tags: [Hosted pages & providers]
@@ -1481,6 +1558,26 @@ components:
       required: true
       content: {application/json: {example: {"permissions": ["balance:read"]}, schema: {$ref: "#/components/schemas/PermissionsBody"}}}
   responses:
+    PaymentLink:
+      description: Payment link
+      content:
+        application/json:
+          example: {"id": "pl_7q3k2m9x4v8p1r6t5w0y2z4b6d", "url": "https://api.paygate.example/l/pl_7q3k2m9x4v8p1r6t5w0y2z4b6d", "environment": "live", "amount": 250000, "currency": "ETB", "description": "Invoice 77: 5 bags of coffee", "reference": "INV-77", "single_use": true, "active": true, "expires_at": "2026-12-01T00:00:00Z", "paid_count": 0, "created_at": "2026-11-04T09:00:00Z"}
+          schema:
+            type: object
+            properties:
+              id: {type: string}
+              url: {type: string}
+              environment: {type: string}
+              amount: {type: integer}
+              currency: {type: string}
+              description: {type: string}
+              reference: {type: string}
+              single_use: {type: boolean}
+              active: {type: boolean}
+              expires_at: {type: string, format: date-time}
+              paid_count: {type: integer}
+              created_at: {type: string, format: date-time}
     DocumentLink:
       description: A download link built now from the stored object key; expires in 5 minutes
       content:

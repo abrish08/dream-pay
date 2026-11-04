@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -267,4 +268,60 @@ func (s *Store) Volume(q *gorm.DB, merchantID, env, currency string, since time.
 			[]string{string(domain.Pending), string(domain.Processing), string(domain.Succeeded),
 				string(domain.PartiallyRefunded), string(domain.Refunded)}).Scan(&row).Error
 	return row.Total, row.N, err
+}
+
+// ---- Payment links ----
+
+var ErrLinkNotFound = apperror.NotFound("payment_link_not_found", "payment link not found")
+
+func (s *Store) InsertLink(q *gorm.DB, l *domain.PaymentLink) error { return q.Create(l).Error }
+
+func (s *Store) SaveLink(q *gorm.DB, l *domain.PaymentLink) error {
+	return q.Select("*").Updates(l).Error
+}
+
+func (s *Store) GetLink(q *gorm.DB, id string, lock bool) (*domain.PaymentLink, error) {
+	if !strings.HasPrefix(id, "pl_") || len(id) > 40 {
+		return nil, ErrLinkNotFound
+	}
+	if lock {
+		q = q.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	var l domain.PaymentLink
+	err := q.Where("id = ?", id).Take(&l).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrLinkNotFound
+	}
+	return &l, err
+}
+
+func (s *Store) ListLinks(q *gorm.DB, merchantID, env string, limit int) ([]domain.PaymentLink, error) {
+	q = q.Where("merchant_id = ?", merchantID)
+	if env != "" {
+		q = q.Where("environment = ?", env)
+	}
+	var out []domain.PaymentLink
+	return out, q.Order("created_at DESC").Limit(limit).Find(&out).Error
+}
+
+// OpenPaymentForLink: a payment of the link that a customer may still pay.
+func (s *Store) OpenPaymentForLink(q *gorm.DB, linkID string, now time.Time) (*domain.Payment, error) {
+	var p domain.Payment
+	err := q.Table(table).Where("link_id = ? AND status IN ? AND expires_at > ?", linkID,
+		[]string{string(domain.Pending), string(domain.Processing)}, now).Order("created_at DESC").Take(&p).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	return &p, err
+}
+
+func (s *Store) SetLinkID(q *gorm.DB, paymentID, linkID string) error {
+	return q.Table(table).Where("id = ?", paymentID).Update("link_id", linkID).Error
+}
+
+// LinkPaid counts a captured payment; a single-use link then closes.
+func (s *Store) LinkPaid(q *gorm.DB, linkID string, now time.Time) error {
+	return q.Model(&domain.PaymentLink{}).Where("id = ?", linkID).Updates(map[string]any{
+		"paid_count": gorm.Expr("paid_count + 1"), "active": gorm.Expr("CASE WHEN single_use THEN false ELSE active END"),
+		"updated_at": now}).Error
 }

@@ -195,3 +195,35 @@ they hold.
 
 All secrets belong in a secret manager (e.g. Azure Key Vault via Managed
 Identity), never in Git or the database.
+
+## Two-factor authentication (authenticator app)
+
+Every user (merchant or staff) can protect their account with Microsoft
+Authenticator, Google Authenticator or any TOTP app:
+
+```
+POST /auth/mfa/totp/setup     → qr_code (PNG data URL to scan), secret (to type), issuer, account
+POST /auth/mfa/totp/confirm   {code} → enabled + 10 recovery codes (shown once)
+POST /auth/login              → {mfa_required, mfa_token}
+POST /auth/login/mfa          {mfa_token, code | recovery code} → tokens
+```
+
+* **One secret per user**, generated on the server, stored **encrypted**
+  (AES-256-GCM); the QR code is drawn on the server (never by a third party).
+* The app shows **"Paygate - <business name>"** for merchant users and
+  **"Paygate Admin"** for staff, with the user's email.
+* Codes: 6 digits, 30 s, ±1 step; a used code cannot be replayed; wrong codes
+  count towards the login lockout. Recovery codes are stored hashed and work
+  once.
+* The session remembers whether it was signed in with MFA (also across
+  refreshes) and the access token says so (`mfa: true`). Enabling MFA does not
+  upgrade sessions that already exist: sign in again.
+
+| Setting (default) | Enforced on |
+|---|---|
+| `REQUIRE_STAFF_MFA=true` | every `/admin` route |
+| `REQUIRE_MERCHANT_MFA=true` | every `/v1` route for dashboard users (API keys are not affected) |
+| `REQUIRE_MFA_FOR_PAYOUTS=true` | `POST /v1/payouts` |
+
+Without MFA these answer `403 mfa_required`; enrolment (`/auth/mfa/...`) is
+always reachable.

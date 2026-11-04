@@ -25,6 +25,9 @@ type Principal struct {
 	Roles       []string `json:"roles,omitempty"`       // users only: ids of every assigned role
 	Environment string   `json:"environment,omitempty"` // API keys only: "live" or "test"
 	Permissions []string `json:"permissions"`           // union of the permissions of all roles
+	// MFA: this session was signed in with a second factor (authenticator
+	// app). Signed into the token, so no service has to ask auth.
+	MFA bool `json:"mfa,omitempty"`
 
 	IssuedAt time.Time `json:"-"` // set from the verified token
 }

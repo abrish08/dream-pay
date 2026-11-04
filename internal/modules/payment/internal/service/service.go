@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"paygate/internal/contracts/disputes"
@@ -471,6 +472,11 @@ func (s *Service) applyProviderResult(ctx context.Context, tx *gorm.DB, p *domai
 		if err := s.store.Save(tx, p, by); err != nil {
 			return err
 		}
+		if p.LinkID != "" {
+			if err := s.store.LinkPaid(tx, p.LinkID, now); err != nil {
+				return err
+			}
+		}
 		paymentsFinal.Inc(p.Environment, string(domain.Succeeded), p.Provider, "")
 		return s.events.Publish(ctx, tx, payments.PaymentSucceeded{
 			PaymentID: p.ID, MerchantID: p.MerchantID, Environment: p.Environment, Amount: p.Amount,
@@ -815,4 +821,138 @@ func (s *Service) disputeNote(ctx context.Context, e bus.Envelope, consumer, pay
 		p.Note(note, s.now())
 		return s.store.Save(tx, p, domain.Actor{Source: domain.SourceDispute})
 	})
+}
+
+// ---- Payment links ----
+
+type LinkInput struct {
+	Amount      int64      `json:"amount"`
+	Currency    string     `json:"currency"`
+	Description string     `json:"description"`
+	Reference   string     `json:"reference"`  // prefix of each payment's reference
+	SingleUse   bool       `json:"single_use"` // an invoice: closes once paid
+	ExpiresAt   *time.Time `json:"expires_at"`
+	Environment string     `json:"environment"` // dashboard users: live (default) or test; API keys: their own
+}
+
+type LinkView struct {
+	ID          string     `json:"id"`
+	URL         string     `json:"url"` // share this
+	Environment string     `json:"environment"`
+	Amount      int64      `json:"amount"`
+	Currency    string     `json:"currency"`
+	Description string     `json:"description,omitempty"`
+	Reference   string     `json:"reference,omitempty"`
+	SingleUse   bool       `json:"single_use"`
+	Active      bool       `json:"active"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	PaidCount   int        `json:"paid_count"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
+
+func (s *Service) linkView(l *domain.PaymentLink) LinkView {
+	return LinkView{ID: l.ID, URL: s.publicBase + "/l/" + l.ID, Environment: l.Environment, Amount: l.Amount,
+		Currency: l.Currency, Description: l.Description, Reference: l.Reference, SingleUse: l.SingleUse,
+		Active: l.Active && l.Usable(s.now()) == nil, ExpiresAt: l.ExpiresAt, PaidCount: l.PaidCount, CreatedAt: l.CreatedAt}
+}
+
+func (s *Service) CreateLink(ctx context.Context, merchantID, env string, in LinkInput) (LinkView, error) {
+	if env == "" {
+		env = in.Environment
+	}
+	if env == "" {
+		env = "live"
+	}
+	m, err := bus.Ask(ctx, s.bus, merchants.GetMerchant{ID: merchantID})
+	if err != nil {
+		return LinkView{}, err
+	}
+	if env == "live" && !merchants.KYCPassed(m.KYCStatus) {
+		return LinkView{}, merchants.ErrKYCRequired
+	}
+	l, err := domain.NewLink(domain.NewLinkInput{MerchantID: merchantID, Environment: env, Amount: in.Amount, Currency: in.Currency,
+		Description: in.Description, Reference: in.Reference, SingleUse: in.SingleUse, ExpiresAt: in.ExpiresAt}, s.now())
+	if err != nil {
+		return LinkView{}, err
+	}
+	return s.linkView(l), s.store.InsertLink(s.db.WithContext(ctx), l)
+}
+
+func (s *Service) ListLinks(ctx context.Context, merchantID, env string, limit int) ([]LinkView, error) {
+	ls, err := s.store.ListLinks(s.db.WithContext(ctx), merchantID, env, limit)
+	out := make([]LinkView, len(ls))
+	for i := range ls {
+		out[i] = s.linkView(&ls[i])
+	}
+	return out, err
+}
+
+func (s *Service) GetLink(ctx context.Context, merchantID, id string) (LinkView, error) {
+	l, err := s.store.GetLink(s.db.WithContext(ctx), id, false)
+	if err != nil {
+		return LinkView{}, err
+	}
+	if l.MerchantID != merchantID {
+		return LinkView{}, store.ErrLinkNotFound
+	}
+	return s.linkView(l), nil
+}
+
+func (s *Service) DeactivateLink(ctx context.Context, merchantID, id string) (LinkView, error) {
+	var l *domain.PaymentLink
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		if l, err = s.store.GetLink(tx, id, true); err != nil {
+			return err
+		}
+		if l.MerchantID != merchantID {
+			return store.ErrLinkNotFound
+		}
+		l.Active, l.UpdatedAt = false, s.now()
+		return s.store.SaveLink(tx, l)
+	})
+	if err != nil {
+		return LinkView{}, err
+	}
+	return s.linkView(l), nil
+}
+
+// OpenLink: a customer visits the link. A single-use link reuses its open
+// payment (two visitors cannot pay it twice: visits are serialised by a
+// lock on the link); a reusable link opens a new payment per visit.
+// Returns the hosted checkout URL.
+func (s *Service) OpenLink(ctx context.Context, id, customerIP string) (string, error) {
+	var checkout string
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		l, err := s.store.GetLink(tx, id, true)
+		if err != nil {
+			return err
+		}
+		if err := l.Usable(s.now()); err != nil {
+			return err
+		}
+		if l.SingleUse {
+			if open, err := s.store.OpenPaymentForLink(tx, l.ID, s.now()); err != nil || open != nil {
+				if open != nil {
+					checkout = s.publicBase + "/pay/" + open.ID
+				}
+				return err
+			}
+		}
+		ref := l.Reference
+		if ref == "" {
+			ref = "LINK"
+		}
+		visit := uuid.NewString()
+		p, _, err := s.Create(ctx, CreateInput{MerchantID: l.MerchantID, Environment: l.Environment,
+			IdempotencyKey: "link:" + l.ID + ":" + visit, Amount: l.Amount, Currency: l.Currency,
+			Reference: ref + "-" + visit[:8], Description: l.Description, CustomerIP: customerIP,
+			Metadata: map[string]string{"payment_link": l.ID}})
+		if err != nil {
+			return err
+		}
+		checkout = p.CheckoutURL
+		return s.store.SetLinkID(tx, p.ID, l.ID)
+	})
+	return checkout, err
 }

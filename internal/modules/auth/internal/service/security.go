@@ -5,12 +5,17 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/skip2/go-qrcode"
+
 	"paygate/internal/contracts/auth"
+	"paygate/internal/contracts/merchants"
 	"paygate/internal/modules/auth/internal/domain"
 	"paygate/internal/modules/auth/internal/store"
 	"paygate/internal/platform/apperror"
+	"paygate/internal/platform/bus"
 	"paygate/internal/platform/reqctx"
 	"paygate/internal/platform/sms"
 )
@@ -161,10 +166,40 @@ const (
 )
 
 type TOTPSetup struct {
-	Secret     string `json:"secret"`      // for manual entry in the app
-	OTPAuthURL string `json:"otpauth_url"` // show as a QR code
+	Secret     string `json:"secret"`      // for manual entry in the app ("enter code manually")
+	OTPAuthURL string `json:"otpauth_url"` // what the QR code contains
+	QRCode     string `json:"qr_code"`     // PNG data URL: <img src="..."> to scan with the app
 	Issuer     string `json:"issuer"`
 	Account    string `json:"account"`
+}
+
+// issuerFor is the name the authenticator app shows above the code, so a
+// person with several accounts can tell them apart: "Paygate - Abebe Coffee"
+// for a merchant's users, "Paygate Admin" for platform staff.
+func (s *Service) issuerFor(ctx context.Context, merchantID string) string {
+	if merchantID == "" {
+		return issuer + " Admin"
+	}
+	m, err := bus.Ask(ctx, s.bus, merchants.GetMerchant{ID: merchantID})
+	if err != nil || strings.TrimSpace(m.Name) == "" {
+		return issuer
+	}
+	name := strings.NewReplacer(":", " ", "/", " ").Replace(strings.TrimSpace(m.Name)) // ':' separates issuer and account
+	if r := []rune(name); len(r) > 40 {
+		name = string(r[:40])
+	}
+	return issuer + " - " + name
+}
+
+// qrDataURL renders the otpauth URL as a QR code PNG (data URL). Generated
+// here, never by a third-party service: the secret must not leave the server
+// except to this user.
+func qrDataURL(content string) (string, error) {
+	png, err := qrcode.Encode(content, qrcode.Medium, 256)
+	if err != nil {
+		return "", err
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png), nil
 }
 
 // SetupTOTP starts enrolment: a new secret, active only after ConfirmTOTP.
@@ -189,7 +224,11 @@ func (s *Service) SetupTOTP(ctx context.Context, actor reqctx.Principal) (TOTPSe
 			return err
 		}
 		u.UpdatedAt = s.now()
-		out = TOTPSetup{Secret: secret, OTPAuthURL: domain.OTPAuthURL(issuer, u.Email, secret), Issuer: issuer, Account: u.Email}
+		label := s.issuerFor(ctx, u.MerchantID)
+		out = TOTPSetup{Secret: secret, OTPAuthURL: domain.OTPAuthURL(label, u.Email, secret), Issuer: label, Account: u.Email}
+		if out.QRCode, err = qrDataURL(out.OTPAuthURL); err != nil {
+			return err
+		}
 		return st.SaveUser(ctx, u)
 	})
 	return out, err
@@ -340,7 +379,7 @@ func (s *Service) checkSecondFactor(ctx context.Context, st *store.Store, u *dom
 // complete issues tokens, or an MFA challenge when the authenticator is on.
 func (s *Service) complete(ctx context.Context, u *domain.User) (Tokens, error) {
 	if !u.MFAEnabled() {
-		return s.startSession(ctx, u)
+		return s.startSession(ctx, u, false)
 	}
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -391,7 +430,7 @@ func (s *Service) LoginMFA(ctx context.Context, mfaToken, code string) (Tokens, 
 	if err := s.merchantAllowed(ctx, u.MerchantID, false); err != nil {
 		return Tokens{}, err
 	}
-	return s.startSession(ctx, u)
+	return s.startSession(ctx, u, true) // the authenticator code was verified
 }
 
 // text sends an SMS in the background.

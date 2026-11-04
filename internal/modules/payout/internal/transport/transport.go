@@ -14,6 +14,8 @@ import (
 type HTTP struct {
 	svc *service.Service
 	log *slog.Logger
+	// RequireMFA: merchant users must have signed in with an authenticator to request payouts.
+	RequireMFA bool
 }
 
 func NewHTTP(svc *service.Service, log *slog.Logger) *HTTP { return &HTTP{svc: svc, log: log} }
@@ -25,7 +27,7 @@ func NewHTTP(svc *service.Service, log *slog.Logger) *HTTP { return &HTTP{svc: s
 //	GET  /v1/payouts       ?status=&limit=&starting_after=
 //	GET  /v1/payouts/{id}
 func (h *HTTP) RegisterPublic(r chi.Router) {
-	r.With(httpx.RequireUser(h.log), httpx.Require(payouts.PermWrite, h.log)).Post("/payouts", h.request)
+	r.With(httpx.RequireUser(h.log), httpx.RequireMFA(h.RequireMFA, h.log), httpx.Require(payouts.PermWrite, h.log)).Post("/payouts", h.request)
 	r.With(httpx.Require(payouts.PermRead, h.log)).Get("/payouts", h.listOwn)
 	r.With(httpx.Require(payouts.PermRead, h.log)).Get("/payouts/{id}", h.getOwn)
 }

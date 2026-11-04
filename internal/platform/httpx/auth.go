@@ -124,6 +124,22 @@ func RequirePlatform(log *slog.Logger) func(http.Handler) http.Handler {
 	})
 }
 
+// ErrMFARequired: the action needs a session signed in with an authenticator.
+var ErrMFARequired = apperror.Forbidden("mfa_required",
+	"sign in with your authenticator app first: set one up with POST /auth/mfa/totp/setup and /confirm, then log in again")
+
+// RequireMFA allows users only when their session passed the authenticator
+// step (off = allow everyone; for local development). API keys are not
+// affected; routes that must refuse them also use RequireUser.
+func RequireMFA(enabled bool, log *slog.Logger) func(http.Handler) http.Handler {
+	return guard(log, func(p reqctx.Principal) error {
+		if enabled && p.Kind == reqctx.KindUser && !p.MFA {
+			return ErrMFARequired
+		}
+		return nil
+	})
+}
+
 // RequireUser allows only logged-in people, not API keys (e.g. managing keys
 // and team members must not be possible with a leaked API key).
 func RequireUser(log *slog.Logger) func(http.Handler) http.Handler {

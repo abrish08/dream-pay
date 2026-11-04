@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"paygate/internal/platform/money"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -13,12 +15,15 @@ import (
 	"paygate/internal/modules/payment/internal/service"
 	"paygate/internal/modules/payment/internal/store"
 	"paygate/internal/platform/bus"
+	"paygate/internal/platform/csvx"
 	"paygate/internal/platform/httpx"
 )
 
 type HTTP struct {
 	svc *service.Service
 	log *slog.Logger
+	// TrustProxy: read the customer's IP from X-Forwarded-For (behind your own proxy only).
+	TrustProxy bool
 }
 
 func NewHTTP(svc *service.Service, log *slog.Logger) *HTTP { return &HTTP{svc: svc, log: log} }
@@ -28,6 +33,84 @@ func (h *HTTP) RegisterPublic(r chi.Router) {
 	r.With(httpx.Require(payments.PermRead, h.log)).Get("/payments", h.list)
 	r.With(httpx.Require(payments.PermRead, h.log)).Get("/payments/{id}", h.get)
 	r.With(httpx.Require(payments.PermRead, h.log)).Get("/payments/{id}/events", h.history)
+
+	r.With(httpx.Require(payments.PermRead, h.log)).Get("/reports/payments.csv", h.paymentsCSV)
+
+	// Payment links: POST/GET /v1/payment-links, GET /v1/payment-links/{id},
+	// POST /v1/payment-links/{id}/deactivate.
+	r.With(httpx.Require(payments.PermWrite, h.log)).Post("/payment-links", func(w http.ResponseWriter, r *http.Request) {
+		var in service.LinkInput
+		if err := httpx.DecodeJSON(r, &in); err != nil {
+			httpx.WriteError(w, r, h.log, err)
+			return
+		}
+		p := httpx.Principal(r)
+		v, err := h.svc.CreateLink(r.Context(), p.MerchantID, p.Environment, in)
+		h.reply(w, r, http.StatusCreated, v, err)
+	})
+	r.With(httpx.Require(payments.PermRead, h.log)).Get("/payment-links", func(w http.ResponseWriter, r *http.Request) {
+		p := httpx.Principal(r)
+		env := p.Environment
+		if env == "" {
+			env = r.URL.Query().Get("environment")
+		}
+		out, err := h.svc.ListLinks(r.Context(), p.MerchantID, env, httpx.QueryInt(r, "limit", 20, 100))
+		h.reply(w, r, http.StatusOK, map[string]any{"data": out}, err)
+	})
+	r.With(httpx.Require(payments.PermRead, h.log)).Get("/payment-links/{id}", func(w http.ResponseWriter, r *http.Request) {
+		v, err := h.svc.GetLink(r.Context(), httpx.Principal(r).MerchantID, chi.URLParam(r, "id"))
+		h.reply(w, r, http.StatusOK, v, err)
+	})
+	r.With(httpx.Require(payments.PermWrite, h.log)).Post("/payment-links/{id}/deactivate", func(w http.ResponseWriter, r *http.Request) {
+		v, err := h.svc.DeactivateLink(r.Context(), httpx.Principal(r).MerchantID, chi.URLParam(r, "id"))
+		h.reply(w, r, http.StatusOK, v, err)
+	})
+}
+
+// paymentsCSV: GET /v1/reports/payments.csv?from=&to=&status=succeeded,refunded
+// streams every payment of the period (newest first), page by page.
+func (h *HTTP) paymentsCSV(w http.ResponseWriter, r *http.Request) {
+	from, to, err := csvx.Period(r, time.Now().UTC())
+	if err != nil {
+		httpx.WriteError(w, r, h.log, err)
+		return
+	}
+	p := httpx.Principal(r)
+	f := service.ListFilter{MerchantID: p.MerchantID, Environment: p.Environment, CreatedFrom: from, CreatedTo: to, Limit: 100}
+	if f.Environment == "" {
+		f.Environment = r.URL.Query().Get("environment")
+	}
+	if s := r.URL.Query().Get("status"); s != "" {
+		f.Statuses = strings.Split(s, ",")
+	}
+	out := csvx.New(w, "payments-"+from.Format("20060102")+"-"+to.Format("20060102")+".csv", []string{"id", "created_at",
+		"environment", "reference", "status", "amount", "fee", "refunded", "reserve", "currency", "payment_method", "provider",
+		"failure_reason", "customer_email", "description"})
+	defer out.Flush()
+	for {
+		page, err := h.svc.ListForMerchant(r.Context(), f)
+		if err != nil {
+			h.log.Error("payments report", "err", err) // headers are sent: the file ends early
+			return
+		}
+		for _, x := range page.Data {
+			_ = out.Row(x.ID, x.CreatedAt.Format(time.RFC3339), x.Environment, x.Reference, x.Status, money.FormatMajor(x.Amount),
+				money.FormatMajor(x.Fee), money.FormatMajor(x.RefundedAmount), money.FormatMajor(x.Reserve), x.Currency, x.PaymentMethod,
+				x.Provider, x.FailureReason, x.CustomerEmail, x.Description)
+		}
+		if !page.HasMore {
+			return
+		}
+		f.StartingAfter = page.NextCursor
+	}
+}
+
+func (h *HTTP) reply(w http.ResponseWriter, r *http.Request, status int, v any, err error) {
+	if err != nil {
+		httpx.WriteError(w, r, h.log, err)
+		return
+	}
+	httpx.WriteJSON(w, status, v)
 }
 
 // RegisterAdmin: platform staff (support, operations, finance) look up any

@@ -68,6 +68,7 @@ type sessionRec struct {
 	RevokedAt  *time.Time `gorm:"type:timestamptz"`
 	ReplacedBy *string    `gorm:"type:uuid"`
 	CreatedAt  time.Time  `gorm:"type:timestamptz;not null"`
+	MFA        bool       `gorm:"not null;default:false"`
 }
 
 func (sessionRec) TableName() string { return "sessions" }

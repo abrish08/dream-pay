@@ -216,6 +216,7 @@ type Session struct {
 	RevokedAt  *time.Time
 	ReplacedBy *string
 	CreatedAt  time.Time
+	MFA        bool // signed in with the authenticator; kept across refreshes
 }
 
 // NewSession returns the session and the raw refresh token (given to the client once).

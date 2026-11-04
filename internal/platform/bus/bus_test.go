@@ -142,13 +142,13 @@ func TestNATSAcrossProcesses(t *testing.T) {
 		t.Skip("TEST_NATS_URL not set")
 	}
 	ctx := context.Background()
-	server, err := bus.NewNATS(ctx, url, quiet())
+	server, err := bus.NewNATS(ctx, url, bus.NATSSecurity{}, quiet())
 	if err != nil {
 		t.Fatal(err)
 	}
 	secured(server)
 	defer server.Close()
-	client, err := bus.NewNATS(ctx, url, quiet())
+	client, err := bus.NewNATS(ctx, url, bus.NATSSecurity{}, quiet())
 	if err != nil {
 		t.Fatal(err)
 	}

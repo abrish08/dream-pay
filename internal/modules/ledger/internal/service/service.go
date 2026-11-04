@@ -224,3 +224,36 @@ func (s *Service) GetPostings(ctx context.Context, q ledger.GetPostings) ([]ledg
 	}
 	return out, nil
 }
+
+// Statement streams the movements of a merchant's available balance with a
+// running balance: onOpening first, then fn per line.
+func (s *Service) Statement(ctx context.Context, merchantID, env, currency string, from, to time.Time,
+	onOpening func(opening int64), fn func(l store.StatementLine, balance int64) error) error {
+	currency = strings.ToUpper(currency)
+	if !money.Supported(currency) {
+		return apperror.Invalid("unsupported_currency", "currency must be ETB or USD")
+	}
+	q, account := s.db.WithContext(ctx), domain.MerchantAvailable(merchantID, env)
+	opening, err := s.store.OpeningBalance(q, account, currency, from)
+	if err != nil {
+		return err
+	}
+	onOpening(opening)
+	balance, after := opening, int64(0)
+	for {
+		lines, err := s.store.Statement(q, account, currency, from, to, after, 500)
+		if err != nil {
+			return err
+		}
+		for _, l := range lines {
+			balance += l.Credit - l.Debit
+			if err := fn(l, balance); err != nil {
+				return err
+			}
+			after = l.ID
+		}
+		if len(lines) < 500 {
+			return nil
+		}
+	}
+}

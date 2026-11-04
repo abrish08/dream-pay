@@ -194,6 +194,8 @@ The libraries on the language pages already retry network errors, `429` and
 | Call | Use |
 |---|---|
 | `GET /v1/payments/{id}` | current status (e.g. if a webhook was missed) |
+| `POST /v1/payment-links` `{amount, currency, description, single_use}` | a URL to share instead of integrating (invoices, social media, a QR at the counter) |
+| `GET /v1/reports/payments.csv`, `/v1/reports/statement.csv` | exports for accounting |
 | `GET /v1/payments/{id}/events` | the payment's full history: every status change, who caused it and why |
 | `GET /v1/payments?reference=ORDER-1001&status=succeeded&limit=20` | search; page with `starting_after=<last id>` while `has_more` is true |
 | `POST /v1/refunds` `{"payment_id", "amount"?, "reason"?}` | refund all (no amount) or part |

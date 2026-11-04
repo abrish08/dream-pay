@@ -184,24 +184,27 @@ func (s *Service) Login(ctx context.Context, email, password string) (Tokens, er
 	return s.complete(ctx, u)
 }
 
-func (s *Service) startSession(ctx context.Context, u *domain.User) (Tokens, error) {
+// startSession: mfa says whether this sign-in passed the authenticator step.
+func (s *Service) startSession(ctx context.Context, u *domain.User, mfa bool) (Tokens, error) {
 	sess, refresh, err := domain.NewSession(u.ID, s.cfg.RefreshTTL, s.now())
 	if err != nil {
 		return Tokens{}, err
 	}
+	sess.MFA = mfa
 	if err := s.store.CreateSession(ctx, sess); err != nil {
 		return Tokens{}, err
 	}
-	return s.tokens(ctx, u, refresh, sess.ExpiresAt)
+	return s.tokens(ctx, u, refresh, sess.ExpiresAt, mfa)
 }
 
 // tokens issues the access token. Roles and permissions are read from the
 // database every time (login and each refresh), never copied from an old token.
-func (s *Service) tokens(ctx context.Context, u *domain.User, refresh string, refreshExp time.Time) (Tokens, error) {
+func (s *Service) tokens(ctx context.Context, u *domain.User, refresh string, refreshExp time.Time, mfa bool) (Tokens, error) {
 	p, roles, err := s.principal(ctx, s.store, u)
 	if err != nil {
 		return Tokens{}, err
 	}
+	p.MFA = mfa
 	access, _, err := s.cfg.Signer.Issue(p, s.cfg.AccessTTL)
 	if err != nil {
 		return Tokens{}, err
@@ -215,11 +218,12 @@ func (s *Service) tokens(ctx context.Context, u *domain.User, refresh string, re
 // rotated means it was copied: every session of that user is revoked.
 func (s *Service) Refresh(ctx context.Context, raw string) (Tokens, error) {
 	var (
-		u         *domain.User
-		newRaw    string
-		newExp    time.Time
-		outcome   error
-		hashOfRaw = domain.HashRefreshToken(raw)
+		u          *domain.User
+		newRaw     string
+		newExp     time.Time
+		outcome    error
+		sessionMFA bool
+		hashOfRaw  = domain.HashRefreshToken(raw)
 	)
 	err := s.store.Tx(ctx, func(st *store.Store) error {
 		old, err := st.SessionByHash(ctx, hashOfRaw)
@@ -245,6 +249,8 @@ func (s *Service) Refresh(ctx context.Context, raw string) (Tokens, error) {
 			return store.ErrSessionNotFound
 		}
 		next, r, err := domain.NewSession(u.ID, s.cfg.RefreshTTL, now)
+		next.MFA = old.MFA // a refresh keeps how the session was signed in, never upgrades it
+		sessionMFA = old.MFA
 		if err != nil {
 			return err
 		}
@@ -263,7 +269,7 @@ func (s *Service) Refresh(ctx context.Context, raw string) (Tokens, error) {
 	if err := s.merchantAllowed(ctx, u.MerchantID, false); err != nil {
 		return Tokens{}, err
 	}
-	return s.tokens(ctx, u, newRaw, newExp)
+	return s.tokens(ctx, u, newRaw, newExp, sessionMFA)
 }
 
 func (s *Service) Logout(ctx context.Context, raw string) error {

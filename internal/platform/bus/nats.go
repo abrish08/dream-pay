@@ -2,6 +2,7 @@ package bus
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,8 +50,47 @@ type NATS struct {
 
 var _ Bus = (*NATS)(nil)
 
-func NewNATS(ctx context.Context, url string, log *slog.Logger) (*NATS, error) {
-	nc, err := nats.Connect(url, nats.Name("paygate"), nats.MaxReconnects(-1), nats.ReconnectWait(time.Second))
+// NATSSecurity: how this service proves itself to NATS and checks NATS.
+// In production use both: TLS (encryption + server identity) and a
+// per-service credentials file whose permissions allow only this service's
+// routes and topics.
+type NATSSecurity struct {
+	CredsFile string // NATS_CREDS_FILE: user JWT + NKey seed (.creds) for this service
+	CAFile    string // NATS_TLS_CA: CA that signed the NATS server certificate
+	CertFile  string // NATS_TLS_CERT / NATS_TLS_KEY: client certificate (mutual TLS)
+	KeyFile   string
+}
+
+func (s NATSSecurity) options() ([]nats.Option, error) {
+	var opts []nats.Option
+	if s.CredsFile != "" {
+		opts = append(opts, nats.UserCredentials(s.CredsFile))
+	}
+	if s.CAFile != "" {
+		opts = append(opts, nats.RootCAs(s.CAFile))
+	}
+	if (s.CertFile == "") != (s.KeyFile == "") {
+		return nil, fmt.Errorf("NATS_TLS_CERT and NATS_TLS_KEY go together")
+	}
+	if s.CertFile != "" {
+		opts = append(opts, nats.ClientCert(s.CertFile, s.KeyFile))
+	}
+	if s.CAFile != "" || s.CertFile != "" {
+		opts = append(opts, nats.Secure(&tls.Config{MinVersion: tls.VersionTLS12}))
+	}
+	return opts, nil
+}
+
+func NewNATS(ctx context.Context, url string, sec NATSSecurity, log *slog.Logger) (*NATS, error) {
+	secure, err := sec.options()
+	if err != nil {
+		return nil, err
+	}
+	if sec.CredsFile == "" && sec.CAFile == "" {
+		log.Warn("NATS without TLS or credentials: keep it on a private network (development only)")
+	}
+	nc, err := nats.Connect(url, append([]nats.Option{nats.Name("paygate"), nats.MaxReconnects(-1),
+		nats.ReconnectWait(time.Second)}, secure...)...)
 	if err != nil {
 		return nil, fmt.Errorf("nats connect: %w", err)
 	}
