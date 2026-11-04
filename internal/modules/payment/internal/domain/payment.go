@@ -71,7 +71,8 @@ type Payment struct {
 	ReturnURL      string
 	CheckoutURL    string
 	FailureReason  string
-	Reserve        int64 // held from the merchant's share for ReserveDays (refund / chargeback cover)
+	LinkID         string // the payment link it was opened from, if any
+	Reserve        int64  // held from the merchant's share for ReserveDays (refund / chargeback cover)
 	ReserveDays    int
 	IdempotencyKey string
 	RequestHash    string

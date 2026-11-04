@@ -26,11 +26,13 @@ type Deps struct {
 	// Scheduled payouts: how often they are checked and the business day's timezone.
 	ScheduleEvery time.Duration
 	Timezone      string
+	RequireMFA    bool // merchant users need MFA to request payouts
 }
 
 type Module struct {
 	*module.Base
-	svc *service.Service
+	svc        *service.Service
+	requireMFA bool
 }
 
 var _ module.Module = (*Module)(nil)
@@ -48,11 +50,12 @@ func New(d Deps) *Module {
 	}
 	base.AddWorker(svc.Worker)
 	base.AddWorker(svc.ScheduleWorker)
-	return &Module{Base: base, svc: svc}
+	return &Module{Base: base, svc: svc, requireMFA: d.RequireMFA}
 }
 
 func (m *Module) RegisterRoutes(r module.Routers) {
 	h := transport.NewHTTP(m.svc, m.Log)
+	h.RequireMFA = m.requireMFA
 	h.RegisterPublic(r.Public)
 	h.RegisterAdmin(r.Admin)
 }

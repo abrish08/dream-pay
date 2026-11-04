@@ -73,7 +73,8 @@ func Build(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *App, er
 	case "memory":
 		a.bus = bus.NewMemory(log)
 	case "nats":
-		if a.bus, err = bus.NewNATS(ctx, cfg.NATSURL, log); err != nil {
+		if a.bus, err = bus.NewNATS(ctx, cfg.NATSURL, bus.NATSSecurity{CredsFile: cfg.NATSCredsFile,
+			CAFile: cfg.NATSTLSCA, CertFile: cfg.NATSTLSCert, KeyFile: cfg.NATSTLSKey}, log); err != nil {
 			return nil, err
 		}
 	default:
@@ -144,7 +145,7 @@ func (a *App) newModule(name string) (module.Module, error) {
 	case payment.Name:
 		return payment.New(payment.Deps{DB: db, Bus: b, Log: log, AllowMockInLive: cfg.AllowMockInLive,
 			PaymentTTL: cfg.PaymentTTL, ExpiryEvery: cfg.PaymentExpiryEvery, PublicBaseURL: cfg.PublicBaseURL,
-			CheckEvery: cfg.PaymentCheckEvery, CheckSchedule: cfg.PaymentCheckSchedule}), nil
+			CheckEvery: cfg.PaymentCheckEvery, CheckSchedule: cfg.PaymentCheckSchedule, TrustProxy: cfg.TrustProxy}), nil
 	case refund.Name:
 		return refund.New(refund.Deps{DB: db, Bus: b, Log: log}), nil
 	case ledger.Name:
@@ -166,7 +167,8 @@ func (a *App) newModule(name string) (module.Module, error) {
 		return risk.New(risk.Deps{DB: db, Bus: b, Log: log}), nil
 	case payout.Name:
 		return payout.New(payout.Deps{DB: db, Bus: b, Log: log, ScheduleEvery: cfg.PayoutScheduleEvery,
-			Timezone: cfg.ReconciliationTimezone}), nil
+			RequireMFA: cfg.RequireMFAForPayouts,
+			Timezone:   cfg.ReconciliationTimezone}), nil
 	case reconciliation.Name:
 		return reconciliation.New(reconciliation.Deps{DB: db, Bus: b, Log: log,
 			Timezone: cfg.ReconciliationTimezone, DailyAfter: cfg.ReconciliationDailyAfter,
@@ -292,11 +294,14 @@ func (a *App) buildRouter() chi.Router {
 
 	var routers module.Routers
 	r.Route("/v1", func(v chi.Router) {
-		v.Use(authMW.Middleware, perCaller, httpx.RequireMerchant(a.log))
+		// Merchant dashboard users sign in with an authenticator (API keys used
+		// by merchant servers are not affected). They enrol through /auth/mfa.
+		v.Use(authMW.Middleware, perCaller, httpx.RequireMerchant(a.log), httpx.RequireMFA(a.cfg.RequireMerchantMFA, a.log))
 		routers.Public = v
 	})
 	r.Route("/admin", func(ad chi.Router) {
-		ad.Use(authMW.Middleware, perCaller, httpx.RequirePlatform(a.log))
+		// Staff accounts can move any merchant's money: they must use MFA.
+		ad.Use(authMW.Middleware, perCaller, httpx.RequirePlatform(a.log), httpx.RequireMFA(a.cfg.RequireStaffMFA, a.log))
 		routers.Admin = ad
 	})
 	r.Group(func(g chi.Router) {

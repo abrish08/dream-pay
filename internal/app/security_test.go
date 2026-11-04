@@ -107,7 +107,8 @@ func TestVerificationAndAuthenticator(t *testing.T) {
 	}
 	setup := c.do("POST", "/auth/mfa/totp/setup", owner, "", nil, 200)
 	secret := setup["secret"].(string)
-	if !strings.HasPrefix(setup["otpauth_url"].(string), "otpauth://totp/Paygate:v@shop.test?") {
+	if !strings.HasPrefix(setup["otpauth_url"].(string), "otpauth://totp/Paygate%20-%20V%20Shop:v@shop.test?") ||
+		setup["issuer"] != "Paygate - V Shop" {
 		t.Fatalf("setup: %v", setup)
 	}
 	if s := time.Now().Unix() % 30; s > 24 { // keep the three codes below in one window range

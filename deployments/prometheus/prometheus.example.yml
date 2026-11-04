@@ -1,0 +1,10 @@
+# Example scrape config. Keep /metrics off the internet; with METRICS_TOKEN
+# set, Prometheus sends it as a bearer token.
+global: {scrape_interval: 15s}
+rule_files: [alerts.yml]
+scrape_configs:
+  - job_name: paygate
+    metrics_path: /metrics
+    authorization: {type: Bearer, credentials_file: /etc/prometheus/paygate-metrics-token}
+    static_configs:
+      - targets: ["paygate-1:8080", "paygate-2:8080"]

@@ -1,0 +1,83 @@
+# Prometheus alert rules for paygate. Load with:
+#   rule_files: [/etc/prometheus/paygate-alerts.yml]
+# Severity "page" = wake someone up; "ticket" = fix in working hours.
+groups:
+  - name: paygate-money
+    rules:
+      - alert: LedgerUnbalanced
+        expr: max(paygate_ledger_unbalanced) > 0
+        for: 1m
+        labels: {severity: page}
+        annotations:
+          summary: "Ledger debits and credits differ ({{ $labels.currency }})"
+          description: "Stop payouts and investigate: GET /admin/ledger/trial-balance."
+      - alert: ReconciliationCritical
+        expr: sum(paygate_reconciliation_open_items{severity="critical"}) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $value }} critical reconciliation differences open"
+          description: "GET /admin/reconciliation/items?status=open&severity=critical"
+      - alert: PaymentsStuck
+        expr: sum(paygate_payments_open{status="stuck"}) > 0
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "{{ $value }} payments stuck in processing for over 15 minutes"
+          description: "Usually a provider not answering; status checks keep asking. Check provider health."
+  - name: paygate-providers
+    rules:
+      - alert: ProviderUnavailable
+        expr: |
+          sum by (provider) (rate(paygate_provider_requests_total{outcome=~"unavailable|unknown"}[5m]))
+            / sum by (provider) (rate(paygate_provider_requests_total[5m])) > 0.2
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Provider {{ $labels.provider }}: over 20% of calls fail or get no answer"
+      - alert: PaymentSuccessRateLow
+        expr: |
+          sum by (provider) (rate(paygate_payments_final_total{status="succeeded",environment="live"}[30m]))
+            / sum by (provider) (rate(paygate_payments_final_total{environment="live"}[30m])) < 0.5
+        for: 30m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Live success rate under 50% on {{ $labels.provider }}"
+  - name: paygate-platform
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(paygate_http_requests_total{status=~"5.."}[5m])) / sum(rate(paygate_http_requests_total[5m])) > 0.02
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "More than 2% of API requests fail with 5xx"
+      - alert: SlowAPI
+        expr: |
+          histogram_quantile(0.99, sum by (le, route) (rate(paygate_http_request_duration_seconds_bucket{route="/v1/payments"}[5m]))) > 2
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "p99 latency of POST /v1/payments above 2 s"
+      - alert: OutboxBacklog
+        expr: max by (module) (paygate_outbox_pending{stat="oldest_seconds"}) > 120
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.module }}: events not published for over 2 minutes (bus down?)"
+      - alert: WebhooksFailing
+        expr: increase(sum(paygate_webhook_deliveries{status="failed"})[1h:5m]) > 10
+        labels: {severity: ticket}
+        annotations:
+          summary: "Webhook deliveries are failing after all retries"
+      - alert: RiskChecksUnavailable
+        expr: increase(paygate_payment_risk_total{outcome="risk_unavailable"}[10m]) > 0
+        labels: {severity: page}
+        annotations:
+          summary: "Payments are being accepted without fraud scoring"
+      - alert: PaygateDown
+        expr: up{job="paygate"} == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "A paygate instance is not answering /metrics"

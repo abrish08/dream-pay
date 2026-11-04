@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"paygate/internal/platform/apperror"
 	"paygate/internal/platform/httpx"
 	"paygate/internal/platform/money"
 )
@@ -22,6 +23,33 @@ import (
 func (h *HTTP) RegisterOpen(r chi.Router) {
 	r.Get("/pay/{id}", h.checkoutPage)
 	r.Post("/pay/{id}", h.chooseMethod)
+	r.Get("/l/{id}", h.openLink) // payment links
+}
+
+// openLink: GET /l/{id} opens a payment for the link and sends the customer
+// to the checkout page. The visitor's IP goes to the risk checks.
+func (h *HTTP) openLink(w http.ResponseWriter, r *http.Request) {
+	url, err := h.svc.OpenLink(r.Context(), chi.URLParam(r, "id"), httpx.ClientIP(r, h.TrustProxy))
+	if err != nil {
+		code := http.StatusNotFound
+		msg := "This payment link does not exist."
+		switch apperror.From(err).Code {
+		case "payment_link_closed":
+			code, msg = http.StatusGone, "This payment link is no longer active."
+		case "risk_declined", "limit_exceeded":
+			code, msg = http.StatusUnprocessableEntity, "This payment cannot be made. Please contact the merchant."
+		case "payment_link_not_found":
+		default:
+			h.log.Error("open payment link", "err", err)
+			code, msg = http.StatusServiceUnavailable, "Payments are unavailable right now. Please try again."
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(msg))
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, url, http.StatusSeeOther)
 }
 
 var checkoutTmpl = template.Must(template.New("checkout").Parse(`<!doctype html>

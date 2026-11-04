@@ -35,6 +35,8 @@ type Config struct {
 	// NATS routes each request to whichever process handles it.
 	Bus     string
 	NATSURL string
+	// NATS security (microservices): per-service credentials and TLS.
+	NATSCredsFile, NATSTLSCA, NATSTLSCert, NATSTLSKey string
 
 	// Auth. Only the auth service holds AUTH_SIGNING_KEY (private). Every
 	// service holds AUTH_PUBLIC_KEYS to verify access tokens locally.
@@ -115,6 +117,12 @@ type Config struct {
 	ReconciliationTimezone   string
 	ReconciliationDailyAfter time.Duration
 	ReconciliationSettleWait time.Duration // tests only: how recent a capture may be before its ledger posting is checked
+	// MFA (authenticator app): required for platform staff on /admin, and for
+	// merchant users requesting payouts. Both default to true; turn off only
+	// for local development.
+	RequireStaffMFA      bool
+	RequireMerchantMFA   bool // every merchant dashboard user (not API keys)
+	RequireMFAForPayouts bool
 	// MetricsToken: if set, /metrics requires "Authorization: Bearer <token>".
 	MetricsToken string
 	// Workers (tests shorten them): reserve release, scheduled payouts, overdue disputes.
@@ -245,6 +253,11 @@ func Load() (Config, error) {
 	}
 
 	c.MetricsToken = os.Getenv("METRICS_TOKEN")
+	c.NATSCredsFile, c.NATSTLSCA = os.Getenv("NATS_CREDS_FILE"), os.Getenv("NATS_TLS_CA")
+	c.NATSTLSCert, c.NATSTLSKey = os.Getenv("NATS_TLS_CERT"), os.Getenv("NATS_TLS_KEY")
+	c.RequireStaffMFA = envBool("REQUIRE_STAFF_MFA", true)
+	c.RequireMerchantMFA = envBool("REQUIRE_MERCHANT_MFA", true)
+	c.RequireMFAForPayouts = envBool("REQUIRE_MFA_FOR_PAYOUTS", true)
 	c.ReconciliationTimezone = env("RECONCILIATION_TIMEZONE", "Africa/Addis_Ababa")
 	if v := os.Getenv("RECONCILIATION_DAILY_AFTER"); v != "" {
 		d, err := time.ParseDuration(v)

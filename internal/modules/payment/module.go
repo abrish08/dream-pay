@@ -33,11 +33,13 @@ type Deps struct {
 	// schedule 1, 2, 5, 10, 20, 30 minutes apart).
 	CheckEvery    time.Duration
 	CheckSchedule []time.Duration
+	TrustProxy    bool // customer IPs from X-Forwarded-For (payment links)
 }
 
 type Module struct {
 	*module.Base
-	svc *service.Service
+	svc        *service.Service
+	trustProxy bool
 }
 
 var _ module.Module = (*Module)(nil)
@@ -53,11 +55,12 @@ func New(d Deps) *Module {
 	}
 	base.AddWorker(svc.ExpiryWorker)
 	base.AddWorker(svc.StatusCheckWorker)
-	return &Module{Base: base, svc: svc}
+	return &Module{Base: base, svc: svc, trustProxy: d.TrustProxy}
 }
 
 func (m *Module) RegisterRoutes(r module.Routers) {
 	h := transport.NewHTTP(m.svc, m.Log)
+	h.TrustProxy = m.trustProxy
 	h.RegisterPublic(r.Public)
 	h.RegisterAdmin(r.Admin)
 	h.RegisterOpen(r.Open)

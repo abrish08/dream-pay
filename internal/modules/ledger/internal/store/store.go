@@ -140,3 +140,32 @@ func (s *Store) ClaimDueHolds(q *gorm.DB, now time.Time, limit int) ([]ReserveHo
 func (s *Store) MarkReleased(q *gorm.DB, paymentID string, now time.Time) error {
 	return q.Model(&ReserveHold{}).Where("payment_id = ?", paymentID).Update("released_at", now).Error
 }
+
+// StatementLine: one movement of a merchant's available balance.
+type StatementLine struct {
+	ID          int64
+	CreatedAt   time.Time
+	Reference   string
+	Description string
+	Debit       int64
+	Credit      int64
+}
+
+// OpeningBalance of a credit-normal account before t.
+func (s *Store) OpeningBalance(q *gorm.DB, account, currency string, t time.Time) (int64, error) {
+	var v int64
+	err := q.Model(&entryRecord{}).Select("COALESCE(SUM(credit - debit), 0)").
+		Where("account = ? AND currency = ? AND created_at < ?", account, currency, t).Scan(&v).Error
+	return v, err
+}
+
+// Statement: movements of account in [from, to), oldest first, after id.
+func (s *Store) Statement(q *gorm.DB, account, currency string, from, to time.Time, afterID int64, limit int) ([]StatementLine, error) {
+	var out []StatementLine
+	err := q.Table("ledger_entries AS e").
+		Select("e.id, e.created_at, t.reference, t.description, e.debit, e.credit").
+		Joins("JOIN ledger_transactions t ON t.id = e.transaction_id").
+		Where("e.account = ? AND e.currency = ? AND e.created_at >= ? AND e.created_at < ? AND e.id > ?", account, currency, from, to, afterID).
+		Order("e.id").Limit(limit).Scan(&out).Error
+	return out, err
+}

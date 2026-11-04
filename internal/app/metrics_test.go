@@ -16,6 +16,9 @@ func TestMetrics(t *testing.T) {
 	defer stop()
 	_, key := c.signup("metrics@shop.test")
 	c.pay(key, "met-1", 5000)
+	c.eventually("ledger booked", func() bool { // the ledger gauge needs entries
+		return c.do("GET", "/v1/balance?currency=ETB", key, "", nil, 200)["available"] == float64(4925)
+	})
 
 	if r, _ := http.Get(c.base + "/metrics"); r.StatusCode != 401 {
 		t.Fatalf("metrics without token: %d", r.StatusCode)
