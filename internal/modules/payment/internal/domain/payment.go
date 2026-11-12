@@ -174,8 +174,12 @@ func NewPayment(in NewPaymentInput, feeBPS int64, now time.Time) (*Payment, erro
 			return nil, apperror.Invalid("invalid_customer_email", "customer email is not valid")
 		}
 	}
-	if len(in.CustomerPhone) > 20 {
-		return nil, apperror.Invalid("invalid_customer_phone", "customer phone is too long")
+	if in.CustomerPhone != "" {
+		n, err := NormalizePhone(in.CustomerPhone)
+		if err != nil {
+			return nil, apperror.Invalid("invalid_customer_phone", "customer.phone must be an Ethiopian mobile number, e.g. +251911234567")
+		}
+		in.CustomerPhone = n
 	}
 	if in.CustomerIP != "" {
 		if _, err := netip.ParseAddr(in.CustomerIP); err != nil {
@@ -327,5 +331,35 @@ func (p *Payment) ApplyRefund(amount int64, now time.Time) error {
 		return err
 	}
 	p.RefundedAmount += amount
+	return nil
+}
+
+// NormalizePhone returns an Ethiopian mobile number as +2519XXXXXXXX or
+// +2517XXXXXXXX (Safaricom); accepts 09..., 07..., 9..., +251..., 251...
+func NormalizePhone(v string) (string, error) {
+	v = strings.NewReplacer(" ", "", "-", "", "(", "", ")", "").Replace(strings.TrimSpace(v))
+	switch {
+	case strings.HasPrefix(v, "+251"):
+		v = v[4:]
+	case strings.HasPrefix(v, "251"):
+		v = v[3:]
+	case strings.HasPrefix(v, "0"):
+		v = v[1:]
+	}
+	if len(v) != 9 || (v[0] != '9' && v[0] != '7') || strings.Trim(v, "0123456789") != "" {
+		return "", ErrInvalidPhone
+	}
+	return "+251" + v, nil
+}
+
+var ErrInvalidPhone = apperror.Invalid("invalid_phone", "enter an Ethiopian mobile number, e.g. 0911 234 567")
+
+// SetPhone records the customer's wallet number (hosted checkout).
+func (p *Payment) SetPhone(phone string, now time.Time) error {
+	n, err := NormalizePhone(phone)
+	if err != nil {
+		return err
+	}
+	p.CustomerPhone, p.UpdatedAt = n, now
 	return nil
 }

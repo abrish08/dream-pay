@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -11,6 +12,7 @@ import (
 	"paygate/internal/contracts/providers"
 	"paygate/internal/modules/provider/internal/gateway"
 	"paygate/internal/modules/provider/internal/store"
+	"paygate/internal/platform/apperror"
 	"paygate/internal/platform/events"
 	"paygate/internal/platform/metrics"
 	"paygate/internal/platform/money"
@@ -315,4 +317,52 @@ func (s *Service) Return(ctx context.Context, provider, txRef string) (*store.Tr
 		s.log.Warn("verify on return failed; the webhook or expiry check will settle it", "tx_ref", txRef, "err", err)
 	}
 	return s.store.GetTransaction(s.store.DB(ctx), txRef, false)
+}
+
+// ---- Bank transfers and instructions ----
+
+// Instructor: adapters whose customers act on their own (bank transfer).
+type Instructor interface {
+	Instructions(txRef string) providers.Instructions
+}
+
+// Instructions answers providers.GetInstructions.
+func (s *Service) Instructions(ctx context.Context, q providers.GetInstructions) (providers.Instructions, error) {
+	t, err := s.store.GetTransaction(s.store.DB(ctx), q.TxRef, false)
+	if err != nil {
+		return providers.Instructions{}, err
+	}
+	if in, ok := s.gateways[t.Provider].(Instructor); ok {
+		return in.Instructions(q.TxRef), nil
+	}
+	return providers.Instructions{}, nil
+}
+
+// ConfirmTransfer: finance saw the customer's transfer on the bank
+// statement. The exact amount must match; the payment then succeeds through
+// the normal verified path (sync → TransactionUpdated).
+func (s *Service) ConfirmTransfer(ctx context.Context, txRef string, amount int64, bankRef, by string) (providers.Transaction, error) {
+	if strings.TrimSpace(bankRef) == "" {
+		return providers.Transaction{}, apperror.Invalid("bank_reference_required", "enter the bank's transaction reference from the statement")
+	}
+	t, err := s.store.GetTransaction(s.store.DB(ctx), txRef, false)
+	if err != nil {
+		return providers.Transaction{}, err
+	}
+	g, ok := s.gateways[t.Provider].(*gateway.BankTransfer)
+	if !ok {
+		return providers.Transaction{}, apperror.Unprocessable("not_a_bank_transfer", "this payment is not a bank transfer")
+	}
+	if _, err := s.store.ConfirmTransfer(s.store.DB(ctx), txRef, amount, t.Currency, strings.TrimSpace(bankRef), by, s.now()); err != nil {
+		return providers.Transaction{}, err
+	}
+	s.log.Info("bank transfer confirmed", "tx_ref", txRef, "by", by, "bank_reference", bankRef)
+	if err := s.sync(ctx, g, txRef); err != nil {
+		return providers.Transaction{}, err
+	}
+	return g.Verify(ctx, txRef)
+}
+
+func (s *Service) PendingTransfers(ctx context.Context, reference string, limit int) ([]store.BankTransfer, error) {
+	return s.store.PendingTransfers(s.store.DB(ctx), reference, limit)
 }

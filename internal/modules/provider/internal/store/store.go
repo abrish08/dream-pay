@@ -3,12 +3,14 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"paygate/internal/contracts/providers"
+	"paygate/internal/platform/apperror"
 )
 
 // Transaction is the provider module's record of every checkout it started.
@@ -149,4 +151,66 @@ func (s *Store) SetMockStatus(ctx context.Context, txRef, status string) error {
 		}
 	}
 	return nil
+}
+
+// ---- Bank transfers (TransferState) ----
+
+type BankTransfer struct {
+	TxRef         string `gorm:"primaryKey"`
+	Provider      string
+	Reference     string
+	Amount        int64
+	Currency      string
+	Status        string
+	BankReference string
+	ConfirmedBy   string
+	ConfirmedAt   *time.Time
+	CreatedAt     time.Time
+}
+
+func (BankTransfer) TableName() string { return "bank_transfers" }
+
+func (s *Store) SaveTransfer(ctx context.Context, provider, txRef, reference string, amount int64, currency string) error {
+	return s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&BankTransfer{TxRef: txRef, Provider: provider,
+		Reference: reference, Amount: amount, Currency: currency, Status: providers.StatusPending, CreatedAt: time.Now().UTC()}).Error
+}
+
+func (s *Store) GetTransfer(ctx context.Context, txRef string) (string, int64, string, error) {
+	var t BankTransfer
+	err := s.db.WithContext(ctx).Where("tx_ref = ?", txRef).Take(&t).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", 0, "", providers.ErrTransactionNotFound
+	}
+	return t.Status, t.Amount, t.Currency, err
+}
+
+// ConfirmTransfer marks a pending transfer received. The amount must match
+// exactly: a partial or larger transfer is handled by finance with the
+// customer, never guessed.
+func (s *Store) ConfirmTransfer(q *gorm.DB, txRef string, amount int64, currency, bankRef, by string, now time.Time) (*BankTransfer, error) {
+	var t BankTransfer
+	if err := q.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tx_ref = ?", txRef).Take(&t).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, providers.ErrTransactionNotFound
+		}
+		return nil, err
+	}
+	switch {
+	case t.Status != providers.StatusPending:
+		return &t, apperror.Conflict("transfer_already_confirmed", "this transfer was already confirmed")
+	case t.Amount != amount || t.Currency != currency:
+		return &t, apperror.Unprocessable("transfer_amount_mismatch",
+			"the amount received does not match the payment; contact the customer (partial or extra transfers are not applied automatically)")
+	}
+	t.Status, t.BankReference, t.ConfirmedBy, t.ConfirmedAt = providers.StatusSucceeded, bankRef, by, &now
+	return &t, q.Save(&t).Error
+}
+
+func (s *Store) PendingTransfers(q *gorm.DB, reference string, limit int) ([]BankTransfer, error) {
+	q = q.Where("status = ?", providers.StatusPending)
+	if reference != "" {
+		q = q.Where("reference = ?", strings.ToUpper(strings.TrimSpace(reference)))
+	}
+	var out []BankTransfer
+	return out, q.Order("created_at").Limit(limit).Find(&out).Error
 }

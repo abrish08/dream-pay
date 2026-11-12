@@ -23,6 +23,18 @@ scrape config with the `METRICS_TOKEN` bearer token.
 Each page needs a runbook: who is on call, the first checks, how to stop
 payouts, whom to call at the provider.
 
+## Database connections
+
+Each module keeps its own connection pool (`DB_MAX_CONNS_PER_MODULE`,
+default 10). One process running every module uses up to 13 × that, so keep
+it below Postgres `max_connections` (100 by default): set
+`DB_MAX_CONNS_PER_MODULE=6`, or raise `max_connections`. Too many
+connections shows up as `too many clients already` and HTTP 500s under load.
+
+Run the application with an **ordinary database role**, not a superuser:
+the ledger and audit log are protected by triggers that only a superuser
+can switch off.
+
 ## NATS (microservices)
 
 In production every service connects to NATS with **TLS** and **its own

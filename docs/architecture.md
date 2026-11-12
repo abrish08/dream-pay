@@ -89,12 +89,13 @@ whether its peer is in-process or in another service.
 | **auth** | `auth.ExchangeAPIKey`, `RegisterPermissions` | `GetMerchant`, `CreateMerchant` (signup) | `AccessChanged` | `MerchantUpdated` |
 | **provider** | `providers.InitiateCheckout`, `VerifyTransaction`, `Refund` | – | `providers.TransactionUpdated` | – |
 | **payment** | `payments.GetPayment`, `ListPayments` | `GetMerchant`, `InitiateCheckout`, `VerifyTransaction` (expiry) | `PaymentSucceeded`, `PaymentFailed`, `PaymentExpired` | `TransactionUpdated`, `RefundSucceeded` |
-| **refund** | – | `GetPayment`, `providers.Refund` | `RefundSucceeded`, `RefundFailed` | – |
-| **ledger** | `ledger.ReserveFunds` | – | – | `PaymentSucceeded`, `RefundSucceeded`, `PayoutPaid`, `PayoutFailed` |
+| **refund** | – | `GetPayment`, `ledger.HoldRefund`, `ReleaseRefund`, `providers.Refund` | `RefundSucceeded`, `RefundFailed` | – |
+| **ledger** | `ledger.ReserveFunds`, `HoldRefund`, `ReleaseRefund`, `GetBalance`, `GetPostings` | – | – | `PaymentSucceeded`, `RefundSucceeded/Failed`, `PayoutPaid/Failed`, `DisputeOpened/Closed`, `SettlementReconciled` |
 | **payout** | – | `GetMerchant`, `ReserveFunds` | `PayoutPaid`, `PayoutFailed` | – |
 | **kyc** | – | `GetMerchant` (email) | `kyc.StatusChanged` | – |
 | **webhook** | – | – | – | payment.\*, refund.\*, payout.\* |
-| **reconciliation** | – | `ListPayments`, `VerifyTransaction` | – | – |
+| **reconciliation** | – | `ListPayments`, `VerifyTransaction` | `SettlementReconciled` | – |
+| **audit** | `audit.Record` (from every service's recorder) | – | – | – |
 
 Every service authenticates its own HTTP requests (see *Authentication and RBAC*).
 

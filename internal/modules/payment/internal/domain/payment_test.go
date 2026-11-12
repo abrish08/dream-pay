@@ -108,3 +108,17 @@ func TestExpiry(t *testing.T) {
 		t.Fatal("succeeded payment cannot expire")
 	}
 }
+
+func TestNormalizePhone(t *testing.T) {
+	for in, want := range map[string]string{"0911 23 45 67": "+251911234567", "+251911234567": "+251911234567",
+		"251711234567": "+251711234567", "911234567": "+251911234567", "07-1123-4567": "+251711234567"} {
+		if got, err := NormalizePhone(in); err != nil || got != want {
+			t.Errorf("%q: %q %v", in, got, err)
+		}
+	}
+	for _, bad := range []string{"", "0811234567", "09112345", "+254711234567x", "phone"} {
+		if _, err := NormalizePhone(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

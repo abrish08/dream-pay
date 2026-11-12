@@ -99,7 +99,7 @@ var SystemRoles = []SystemRole{
 var DefaultMerchantPermissions = []string{
 	"payments:read", "payments:write", "refunds:write", "balance:read", "webhooks:write",
 	"apikeys:manage", "team:manage", "roles:read", "roles:manage",
-	"kyc:read", "kyc:write", "payouts:read", "payouts:write", "disputes:read", "disputes:write",
+	"kyc:read", "kyc:write", "payouts:read", "payouts:write", "disputes:read", "disputes:write", "audit:read",
 }
 
 var roleNamespace = uuid.MustParse("6f0c6a52-0b7e-4c1e-9d1a-9a3b1c2d4e5f")

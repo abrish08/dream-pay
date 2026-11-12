@@ -4,10 +4,12 @@ package domain
 
 import (
 	"fmt"
+	"strings"
 
 	"paygate/internal/contracts/disputes"
 	"paygate/internal/contracts/payments"
 	"paygate/internal/contracts/payouts"
+	"paygate/internal/contracts/reconciliation"
 	"paygate/internal/contracts/refunds"
 	"paygate/internal/platform/apperror"
 )
@@ -162,4 +164,105 @@ func DisputeClosed(e disputes.DisputeClosed) Posting {
 			Line{Account: PlatformFees(e.Environment), Credit: e.Fee})
 	}
 	return Posting{Reference: "dispute:" + e.DisputeID + ":closed", Currency: e.Currency, Description: "dispute lost", Lines: lines}
+}
+
+// ---- Refund holds, settlements, corrections ----
+
+// MerchantRefundsPending: the merchant's money held for refunds in progress.
+func MerchantRefundsPending(merchantID, env string) string {
+	return "merchant:" + merchantID + ":refunds_pending:" + env
+}
+
+// ProviderFees: what providers charge us (an expense of the platform).
+func ProviderFees(provider, env string) string {
+	return "platform:provider_fees:" + provider + ":" + env
+}
+
+// SettlementDifferences: deposits that did not match a provider's report,
+// waiting for finance to explain them.
+func SettlementDifferences(env string) string { return "platform:settlement_differences:" + env }
+
+// Adjustments: the platform's side of approved manual corrections.
+func Adjustments(env string) string { return "platform:adjustments:" + env }
+
+// RefundHeld: before a refund goes to the provider its amount is held.
+func RefundHeld(refundID, merchantID, env, currency string, amount int64) Posting {
+	return Posting{Reference: RefundHoldRef(refundID), Currency: currency, Description: "refund hold",
+		Lines: []Line{
+			{Account: MerchantAvailable(merchantID, env), Debit: amount},
+			{Account: MerchantRefundsPending(merchantID, env), Credit: amount},
+		}}
+}
+
+func RefundHoldRef(refundID string) string { return "refund:" + refundID + ":held" }
+
+// RefundPaidFromHold: the held amount goes back to the customer through the provider.
+func RefundPaidFromHold(e refunds.RefundSucceeded) Posting {
+	return Posting{Reference: "refund:" + e.RefundID + ":succeeded", Currency: e.Currency,
+		Description: "refund of payment " + e.PaymentID, Lines: []Line{
+			{Account: MerchantRefundsPending(e.MerchantID, e.Environment), Debit: e.Amount},
+			{Account: ProviderClearing(e.Provider, e.Environment), Credit: e.Amount},
+		}}
+}
+
+// RefundReleased: a failed refund's hold goes back to the available balance.
+func RefundReleased(e refunds.RefundFailed) Posting {
+	return Posting{Reference: "refund:" + e.RefundID + ":released", Currency: e.Currency,
+		Description: "refund failed: " + e.Reason, Lines: []Line{
+			{Account: MerchantRefundsPending(e.MerchantID, e.Environment), Debit: e.Amount},
+			{Account: MerchantAvailable(e.MerchantID, e.Environment), Credit: e.Amount},
+		}}
+}
+
+// PaymentBanked: money paid by bank transfer lands directly in our bank, so
+// the provider's clearing account is settled at once.
+func PaymentBanked(e payments.PaymentSucceeded) Posting {
+	return Posting{Reference: "payment:" + e.PaymentID + ":banked", Currency: e.Currency,
+		Description: "bank transfer received " + e.Reference, Lines: []Line{
+			{Account: SettlementBank(e.Environment), Debit: e.Amount},
+			{Account: ProviderClearing(e.Provider, e.Environment), Credit: e.Amount},
+		}}
+}
+
+// IsBankTransfer: providers whose money arrives straight in our bank account.
+func IsBankTransfer(provider string) bool { return strings.HasPrefix(provider, "bank_transfer") }
+
+// SettlementBooked: a provider paid out a settlement. The clearing account
+// is reduced by what the report settled (payments minus refunds), the
+// provider's fees are an expense, the deposit is cash in the bank, and any
+// difference waits in settlement differences.
+func SettlementBooked(e reconciliation.SettlementReconciled) Posting {
+	settled := e.Gross - e.Refunds
+	diff := e.Deposit - (settled - e.ProviderFees)
+	var lines []Line
+	add := func(account string, debit int64) { // positive: debit, negative: credit
+		switch {
+		case debit > 0:
+			lines = append(lines, Line{Account: account, Debit: debit})
+		case debit < 0:
+			lines = append(lines, Line{Account: account, Credit: -debit})
+		}
+	}
+	add(SettlementBank(e.Environment), e.Deposit)
+	add(ProviderFees(e.Provider, e.Environment), e.ProviderFees)
+	add(ProviderClearing(e.Provider, e.Environment), -settled)
+	add(SettlementDifferences(e.Environment), -diff)
+	return Posting{Reference: "settlement:" + e.SettlementID + ":" + e.Currency, Currency: e.Currency,
+		Description: "settlement from " + e.Provider, Lines: lines}
+}
+
+// Adjustment directions.
+const (
+	AdjustCredit = "credit" // give the merchant money (e.g. a fee charged by mistake)
+	AdjustDebit  = "debit"  // take money from the merchant (e.g. a duplicate credit)
+)
+
+// AdjustmentPosting: an approved manual correction of a merchant's balance.
+func AdjustmentPosting(id, merchantID, env, currency, direction, reason string, amount int64) Posting {
+	merchant, platform := MerchantAvailable(merchantID, env), Adjustments(env)
+	lines := []Line{{Account: platform, Debit: amount}, {Account: merchant, Credit: amount}}
+	if direction == AdjustDebit {
+		lines = []Line{{Account: merchant, Debit: amount}, {Account: platform, Credit: amount}}
+	}
+	return Posting{Reference: "adjustment:" + id, Currency: currency, Description: "correction: " + reason, Lines: lines}
 }

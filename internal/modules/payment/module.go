@@ -13,7 +13,9 @@ import (
 	"paygate/internal/modules/payment/internal/service"
 	"paygate/internal/modules/payment/internal/transport"
 	"paygate/internal/platform/bus"
+	"paygate/internal/platform/mail"
 	"paygate/internal/platform/module"
+	"paygate/internal/platform/sms"
 )
 
 //go:embed migrations/*.sql
@@ -34,6 +36,8 @@ type Deps struct {
 	CheckEvery    time.Duration
 	CheckSchedule []time.Duration
 	TrustProxy    bool // customer IPs from X-Forwarded-For (payment links)
+	Mailer        mail.Sender
+	SMS           sms.Sender // customer receipts (nil = off)
 }
 
 type Module struct {
@@ -53,6 +57,7 @@ func New(d Deps) *Module {
 	if len(d.CheckSchedule) > 0 {
 		svc.CheckSchedule = d.CheckSchedule
 	}
+	svc.SetNotifiers(service.Notifiers{Mail: d.Mailer, SMS: d.SMS})
 	base.AddWorker(svc.ExpiryWorker)
 	base.AddWorker(svc.StatusCheckWorker)
 	return &Module{Base: base, svc: svc, trustProxy: d.TrustProxy}
@@ -75,5 +80,7 @@ func (m *Module) RegisterHandlers(b bus.Bus) {
 	bus.On(b, "payment.on_provider_transaction_updated", m.svc.OnProviderTransactionUpdated)
 	bus.On(b, "payment.on_refund_succeeded", m.svc.OnRefundSucceeded)
 	bus.On(b, "payment.on_dispute_opened", m.svc.OnDisputeOpened)
+	bus.On(b, "payment.receipt", m.svc.OnPaymentReceipt)
+	bus.On(b, "payment.refund_receipt", m.svc.OnRefundReceipt)
 	bus.On(b, "payment.on_dispute_closed", m.svc.OnDisputeClosed)
 }

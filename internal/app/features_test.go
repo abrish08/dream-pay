@@ -373,14 +373,14 @@ func TestPaymentMethodsAndHostedCheckout(t *testing.T) {
 		t.Fatalf("checkout page %d: %s", resp.StatusCode, page)
 	}
 	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	resp, err = noRedirect.PostForm(c.base+"/pay/"+hid, url.Values{"method": {"cbe_birr"}})
+	resp, err = noRedirect.PostForm(c.base+"/pay/"+hid, url.Values{"method": {"cbe_birr"}, "phone": {"0911234567"}})
 	if err != nil || resp.StatusCode != 303 {
 		t.Fatalf("choose method: %v %v", err, resp)
 	}
 	providerURL := resp.Header.Get("Location")
 	resp.Body.Close()
 	// Double submit (second tab): same checkout, no second charge.
-	resp, _ = noRedirect.PostForm(c.base+"/pay/"+hid, url.Values{"method": {"telebirr"}})
+	resp, _ = noRedirect.PostForm(c.base+"/pay/"+hid, url.Values{"method": {"telebirr"}, "phone": {"0911234567"}})
 	if resp.Header.Get("Location") != providerURL {
 		t.Fatal("second submit started another checkout")
 	}
@@ -393,7 +393,7 @@ func TestPaymentMethodsAndHostedCheckout(t *testing.T) {
 	resp, _ = http.Get(c.base + "/pay/" + hid)
 	page, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !strings.Contains(string(page), "succeeded") || strings.Contains(string(page), `name="method"`) {
+	if !strings.Contains(string(page), "Payment successful") || strings.Contains(string(page), `name="method"`) {
 		t.Fatal("a paid payment must not offer methods again")
 	}
 

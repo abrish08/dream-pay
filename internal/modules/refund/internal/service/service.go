@@ -11,6 +11,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"paygate/internal/contracts/ledger"
 	"paygate/internal/contracts/payments"
 	"paygate/internal/contracts/providers"
 	"paygate/internal/contracts/refunds"
@@ -120,16 +121,34 @@ func (s *Service) execute(ctx context.Context, id string) error {
 	if err != nil || r.Final() {
 		return err
 	}
-	res, err := bus.Ask(ctx, s.bus, providers.Refund{
-		Provider: r.Provider, TxRef: r.PaymentID, RefundRef: r.ID,
-		Amount: r.Amount, Currency: r.Currency, Reason: r.Reason,
-	})
-	if err != nil {
-		var ae *apperror.Error
-		if errors.As(err, &ae) && ae.Kind == apperror.KindUnavailable {
-			return err // transient: stay pending
+	var res providers.RefundResult
+	// First the ledger holds the amount, so a merchant can never refund money
+	// it no longer has (or refund the same money twice in parallel).
+	if err := s.holdFunds(ctx, r); err != nil {
+		if apperror.From(err).Code != ledger.ErrInsufficientForRefund.Code {
+			return err // ledger unreachable: stay pending, the worker retries
 		}
-		res = providers.RefundResult{Status: providers.StatusFailed, FailureReason: apperror.From(err).Message}
+		res = providers.RefundResult{Status: providers.StatusFailed, FailureReason: "insufficient_balance"}
+	} else {
+		res, err = bus.Ask(ctx, s.bus, providers.Refund{
+			Provider: r.Provider, TxRef: r.PaymentID, RefundRef: r.ID,
+			Amount: r.Amount, Currency: r.Currency, Reason: r.Reason,
+		})
+		if err != nil {
+			var ae *apperror.Error
+			if errors.As(err, &ae) && ae.Kind == apperror.KindUnavailable {
+				return err // transient: stay pending (the hold stays too)
+			}
+			res = providers.RefundResult{Status: providers.StatusFailed, FailureReason: apperror.From(err).Message}
+		}
+	}
+	if res.Status != providers.StatusSucceeded && res.FailureReason != "insufficient_balance" {
+		// Declined: give the held money back now (the RefundFailed event
+		// would do it a moment later; it is booked only once).
+		if _, err := bus.Ask(ctx, s.bus, ledger.ReleaseRefund{RefundID: r.ID, PaymentID: r.PaymentID, MerchantID: r.MerchantID,
+			Environment: r.Environment, Currency: r.Currency, Amount: r.Amount, Reason: res.FailureReason}); err != nil {
+			s.log.Warn("refund hold not released yet, the event will release it", "refund_id", r.ID, "err", err)
+		}
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		r, err := s.store.Get(tx, id, true)
@@ -156,6 +175,19 @@ func (s *Service) execute(ctx context.Context, id string) error {
 			Amount: r.Amount, Currency: r.Currency, Reason: r.FailureReason, OccurredAt: now,
 		})
 	})
+}
+
+// holdFunds asks the ledger to hold the refund amount (idempotent per refund).
+// The payment's fee is not refunded to the merchant, so the balance may go
+// below zero by at most that fee (plus the merchant's rolling reserve).
+func (s *Service) holdFunds(ctx context.Context, r *domain.Refund) error {
+	p, err := bus.Ask(ctx, s.bus, payments.GetPayment{MerchantID: r.MerchantID, PaymentID: r.PaymentID})
+	if err != nil {
+		return err
+	}
+	_, err = bus.Ask(ctx, s.bus, ledger.HoldRefund{RefundID: r.ID, PaymentID: r.PaymentID, MerchantID: r.MerchantID,
+		Environment: r.Environment, Currency: r.Currency, Amount: r.Amount, Allowance: p.Fee})
+	return err
 }
 
 // RetryPending is a background worker that finishes refunds left pending.

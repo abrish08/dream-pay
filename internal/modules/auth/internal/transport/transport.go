@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -13,6 +14,7 @@ import (
 	"paygate/internal/platform/authn"
 	"paygate/internal/platform/bus"
 	"paygate/internal/platform/httpx"
+	"paygate/internal/platform/reqctx"
 )
 
 type HTTP struct {
@@ -166,6 +168,7 @@ func (h *HTTP) login(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &body) {
 		return
 	}
+	auditEmail(r, body.Email)
 	t, err := h.svc.Login(r.Context(), body.Email, body.Password)
 	h.respond(w, r, http.StatusOK, t, err)
 }
@@ -178,6 +181,7 @@ func (h *HTTP) verify(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &body) {
 		return
 	}
+	auditEmail(r, body.Email)
 	t, err := h.svc.VerifyAccount(r.Context(), body.Email, body.Code)
 	h.respond(w, r, http.StatusOK, t, err)
 }
@@ -190,6 +194,7 @@ func (h *HTTP) resendCode(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &body) {
 		return
 	}
+	auditEmail(r, body.Email)
 	if err := h.svc.ResendVerification(r.Context(), body.Email, body.Channel); err != nil {
 		h.log.Error("resend verification", "err", err)
 	}
@@ -246,6 +251,7 @@ func (h *HTTP) signup(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &body) {
 		return
 	}
+	auditEmail(r, body.Email)
 	t, err := h.svc.Signup(r.Context(), body)
 	h.respond(w, r, http.StatusCreated, t, err)
 }
@@ -270,6 +276,7 @@ func (h *HTTP) forgot(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &body) {
 		return
 	}
+	auditEmail(r, body.Email)
 	if err := h.svc.ForgotPassword(r.Context(), body.Email, httpx.ClientIP(r, false)); err != nil {
 		h.log.Error("forgot password", "err", err) // never tell the client: the answer is always the same
 	}
@@ -497,4 +504,10 @@ func (h *HTTP) noContent(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// auditEmail records which account a sign-in style request was about (the
+// request carries no token yet). Never the password or the code.
+func auditEmail(r *http.Request, email string) {
+	reqctx.AuditDetail(r.Context(), "email", strings.ToLower(strings.TrimSpace(email)))
 }

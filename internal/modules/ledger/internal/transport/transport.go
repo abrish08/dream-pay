@@ -68,8 +68,67 @@ func (h *HTTP) statement(w http.ResponseWriter, r *http.Request) {
 	out.Flush()
 }
 
+// RegisterAdmin:
+//
+//	GET  /admin/ledger/trial-balance
+//	GET  /admin/ledger/summary?environment=live&currency=ETB   owed to merchants vs cash
+//	GET  /admin/ledger/adjustments?status=pending_approval
+//	POST /admin/ledger/adjustments                             request a correction
+//	POST /admin/ledger/adjustments/{id}/approve|reject         a second person decides
 func (h *HTTP) RegisterAdmin(r chi.Router) {
-	r.With(httpx.Require(ledger.PermLedgerRead, h.log)).Get("/ledger/trial-balance", h.trialBalance)
+	read := httpx.Require(ledger.PermLedgerRead, h.log)
+	r.With(read).Get("/ledger/trial-balance", h.trialBalance)
+	r.With(read).Get("/ledger/summary", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		env, cur := q.Get("environment"), q.Get("currency")
+		if env == "" {
+			env = "live"
+		}
+		if cur == "" {
+			cur = "ETB"
+		}
+		out, err := h.svc.Summary(r.Context(), env, cur)
+		h.reply(w, r, http.StatusOK, out, err)
+	})
+	r.With(read).Get("/ledger/adjustments", func(w http.ResponseWriter, r *http.Request) {
+		out, err := h.svc.ListAdjustments(r.Context(), r.URL.Query().Get("status"), httpx.QueryInt(r, "limit", 50, 200))
+		h.reply(w, r, http.StatusOK, map[string]any{"data": out}, err)
+	})
+	r.With(httpx.RequireUser(h.log), httpx.Require(ledger.PermAdjustRequest, h.log)).Post("/ledger/adjustments", func(w http.ResponseWriter, r *http.Request) {
+		var in service.AdjustmentInput
+		if err := httpx.DecodeJSON(r, &in); err != nil {
+			httpx.WriteError(w, r, h.log, err)
+			return
+		}
+		out, err := h.svc.RequestAdjustment(r.Context(), httpx.Principal(r), in)
+		h.reply(w, r, http.StatusCreated, out, err)
+	})
+	decide := func(approve bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Note string `json:"note"`
+			}
+			if r.ContentLength != 0 {
+				if err := httpx.DecodeJSON(r, &body); err != nil {
+					httpx.WriteError(w, r, h.log, err)
+					return
+				}
+			}
+			out, err := h.svc.DecideAdjustment(r.Context(), httpx.Principal(r), chi.URLParam(r, "id"), approve, body.Note)
+			h.reply(w, r, http.StatusOK, out, err)
+		}
+	}
+	approver := r.With(httpx.RequireUser(h.log), httpx.Require(ledger.PermAdjustApprove, h.log))
+	approver.Post("/ledger/adjustments/{id}/approve", decide(true))
+	approver.Post("/ledger/adjustments/{id}/reject", decide(false))
+}
+
+func (h *HTTP) reply(w http.ResponseWriter, r *http.Request, status int, v any, err error) {
+	if err != nil {
+		httpx.WriteError(w, r, h.log, err)
+		return
+	}
+	httpx.WriteJSON(w, status, v)
 }
 
 func (h *HTTP) balance(w http.ResponseWriter, r *http.Request) {

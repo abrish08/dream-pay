@@ -103,6 +103,38 @@ no evidence by evidence_due_by → lost automatically
 * Evidence files are kept in the dispute database (bytea). For large volumes,
   move them to object storage like KYC documents.
 
+## Ledger rules
+
+The double-entry ledger is the record of who owns which money.
+
+* **Cannot be edited.** The database refuses `UPDATE`, `DELETE` and
+  `TRUNCATE` on ledger tables and checks at commit that every posting has
+  at least two lines, one currency and equal debits and credits. Mistakes
+  are fixed with a new posting (a correction, below).
+* **Refunds need the money.** Before a refund reaches the provider its amount
+  is held (`available` → `refunds_pending`). If the balance is too low the
+  refund ends `failed` with `failure_reason: insufficient_balance`. The
+  balance may go below zero only by that payment's fee (fees are not
+  returned on refunds) plus the merchant's rolling reserve. A declined
+  refund gives the hold back at once.
+* **Disputes can make a balance negative** (the card network takes the money
+  anyway). Finance is alerted (`MerchantBalanceNegative`), payouts are
+  blocked, and new payments repay the debt first.
+* **Cash is booked.** A provider's settlement (uploaded and reconciled) moves
+  the settled amount from `provider:clearing` to `platform:settlement_bank`,
+  books the provider's fees as an expense and parks any deposit difference
+  in `platform:settlement_differences`. Bank-transfer payments are cash in
+  the bank as soon as finance confirms them.
+* **Corrections need two people.** `POST /admin/ledger/adjustments`
+  (`ledger:adjust`) records a request with a reason; another staff member
+  approves or rejects it (`ledger:approve`). The database refuses a decision
+  by the requester. Approved corrections post against `platform:adjustments`.
+* **Summary:** `GET /admin/ledger/summary?environment=live&currency=ETB`:
+  owed to merchants (available, reserve, dispute holds, payouts and refunds
+  pending), cash in the bank, still owed by providers, fees earned, provider
+  fees, corrections, settlement differences, merchants with a negative
+  balance, and `balanced` (must be true).
+
 ## Monitoring
 
 `GET /metrics` (Prometheus format; `METRICS_TOKEN` protects it):

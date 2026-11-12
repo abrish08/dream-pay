@@ -30,6 +30,7 @@ tags:
   - {name: Admin - risk & disputes}
   - {name: Admin - roles}
   - {name: Admin - money}
+  - {name: Activity log, description: "Who did what: every change, sign-in and sensitive read, append-only and hash-chained"}
   - {name: Hosted pages & providers, description: Called by customers' browsers and by payment providers}
   - {name: System}
 
@@ -803,6 +804,24 @@ paths:
       summary: Role, team and account changes (roles:read)
       responses: {"200": {$ref: "#/components/responses/AuditLog"}}
 
+  /v1/audit-logs:
+    get:
+      tags: [Activity log]
+      summary: Your business's activity log, newest first (audit:read)
+      description: |
+        Every action by your team members and API keys: what was done, by whom, from which IP, and the
+        result. Only your own business is ever returned. Filters: `actor_id`, `actor_kind`
+        (user, api_key), `action` (prefix, e.g. `payouts.`), `resource_id`, `outcome`
+        (success, denied, rejected, rate_limited, error), `from`, `to` (RFC 3339), `limit` (max 200),
+        `starting_after` (the `next_cursor` of the previous page).
+      parameters:
+        - {name: action, in: query, schema: {type: string}, example: "payouts."}
+        - {name: outcome, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, maximum: 200}}
+        - {name: starting_after, in: query, schema: {type: integer}}
+      responses:
+        "200": {$ref: "#/components/responses/AuditLogs"}
+
   # ---------------- KYC (merchant) ----------------
   /v1/kyc:
     get:
@@ -1118,6 +1137,109 @@ paths:
                   data:
                     type: array
                     items: {type: object, properties: {currency: {type: string}, debits: {type: integer}, credits: {type: integer}, balanced: {type: boolean}}}
+  /admin/ledger/summary:
+    get:
+      tags: [Admin - money]
+      summary: What is owed to merchants against cash in the bank and money with providers (ledger:read)
+      parameters:
+        - {name: environment, in: query, schema: {type: string, enum: [live, test], default: live}}
+        - {name: currency, in: query, schema: {type: string, enum: [ETB, USD], default: ETB}}
+      responses:
+        "200":
+          description: Summary; `balanced` must be true, `negative_merchants` need follow-up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  owed_to_merchants: {type: integer}
+                  merchant_parts: {type: object, additionalProperties: {type: integer}}
+                  cash_in_bank: {type: integer}
+                  owed_by_providers: {type: integer}
+                  fees_earned: {type: integer}
+                  provider_fees_paid: {type: integer}
+                  corrections: {type: integer}
+                  settlement_differences: {type: integer}
+                  balanced: {type: boolean}
+                  cash_shortfall: {type: integer}
+                  negative_merchants: {type: array, items: {type: object, properties: {merchant_id: {type: string}, balance: {type: integer}}}}
+  /admin/ledger/adjustments:
+    get:
+      tags: [Admin - money]
+      summary: Manual corrections, newest first (ledger:read)
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [pending_approval, approved, rejected]}}
+      responses:
+        "200": {description: "Corrections", content: {application/json: {schema: {type: object, properties: {data: {type: array, items: {$ref: "#/components/schemas/Adjustment"}}}}}}}
+    post:
+      tags: [Admin - money]
+      summary: Request a correction of a merchant's balance (ledger:adjust); someone else must approve it
+      description: |
+        `credit` gives the merchant money (e.g. a fee charged by mistake), `debit` takes it
+        (e.g. a duplicate credit). Nothing is booked until a different staff member approves.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [merchant_id, environment, currency, direction, amount, reason]
+              properties:
+                merchant_id: {type: string, format: uuid}
+                environment: {type: string, enum: [live, test]}
+                currency: {type: string, enum: [ETB, USD]}
+                direction: {type: string, enum: [credit, debit]}
+                amount: {type: integer, description: minor units}
+                reason: {type: string, minLength: 10}
+            example: {merchant_id: "00000000-0000-0000-0000-000000000000", environment: test, currency: ETB, direction: credit, amount: 1500, reason: "fee charged twice on ORD-1001, ticket 482"}
+      responses:
+        "201": {description: "Waiting for approval", content: {application/json: {schema: {$ref: "#/components/schemas/Adjustment"}}}}
+  /admin/ledger/adjustments/{id}/approve:
+    post:
+      tags: [Admin - money]
+      summary: Approve and book a correction (ledger:approve; not your own request)
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      requestBody:
+        content: {application/json: {schema: {type: object, properties: {note: {type: string}}}, example: {note: "checked against the bank statement"}}}
+      responses:
+        "200": {description: "Approved and booked", content: {application/json: {schema: {$ref: "#/components/schemas/Adjustment"}}}}
+  /admin/ledger/adjustments/{id}/reject:
+    post:
+      tags: [Admin - money]
+      summary: Reject a correction (ledger:approve; not your own request)
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      requestBody:
+        content: {application/json: {schema: {type: object, properties: {note: {type: string}}}, example: {note: "not supported by the statement"}}}
+      responses:
+        "200": {description: "Rejected", content: {application/json: {schema: {$ref: "#/components/schemas/Adjustment"}}}}
+  /admin/audit-logs:
+    get:
+      tags: [Activity log]
+      summary: Every action on the platform, any merchant (audit:read_all)
+      description: Same filters as `/v1/audit-logs`, plus `merchant_id`.
+      parameters:
+        - {name: merchant_id, in: query, schema: {type: string}}
+        - {name: actor_kind, in: query, schema: {type: string, enum: [user, api_key, staff, customer, provider, system, anonymous]}}
+        - {name: action, in: query, schema: {type: string}}
+      responses:
+        "200": {$ref: "#/components/responses/AuditLogs"}
+  /admin/audit-logs/verify:
+    get:
+      tags: [Activity log]
+      summary: Recompute the hash chain; any changed or removed entry is reported (audit:read_all)
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  intact: {type: boolean}
+                  checked: {type: integer}
+                  last_id: {type: integer}
+                  broken_at: {type: integer}
+                  problem: {type: string}
   /admin/reconciliation/runs:
     post:
       tags: [Admin - money]
@@ -1226,6 +1348,27 @@ paths:
       responses:
         "200": {description: Settlement, content: {application/json: {schema: {$ref: "#/components/schemas/Settlement"}}}}
         "404": {$ref: "#/components/responses/Error"}
+  /admin/bank-transfers:
+    get:
+      tags: [Admin - money]
+      summary: Bank transfers waiting for the money, e.g. ?reference=PG3F9A1C0B27 (providers:confirm_transfers)
+      parameters:
+        - {name: reference, in: query, schema: {type: string}, description: The reference the customer wrote on the transfer}
+        - {$ref: "#/components/parameters/Limit"}
+      responses: {"200": {description: Pending transfers}}
+  /admin/bank-transfers/{paymentId}/confirm:
+    post:
+      tags: [Admin - money]
+      summary: Confirm a transfer seen on the bank statement (providers:confirm_transfers, finance)
+      description: The amount must match the payment exactly (`422 transfer_amount_mismatch` otherwise; contact the customer). The payment then succeeds through the normal verified path; a second confirmation is refused (`409`).
+      parameters: [{name: paymentId, in: path, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            example: {"amount": 125000, "bank_reference": "FT26110XYZ123"}
+            schema: {type: object, required: [amount, bank_reference], properties: {amount: {type: integer}, bank_reference: {type: string}}}
+      responses: {"200": {description: Confirmed}, "400": {$ref: "#/components/responses/Error"}, "409": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
   /admin/risk/blocklist:
     get:
       tags: [Admin - risk & disputes]
@@ -1402,6 +1545,17 @@ paths:
       responses:
         "200": {description: The file, content: {application/pdf: {}, image/jpeg: {}, image/png: {}}}
         "404": {$ref: "#/components/responses/Error"}
+  /pay/{id}/status:
+    get:
+      tags: [Hosted pages & providers]
+      summary: Status of a payment, polled by the checkout page while the customer approves on their phone
+      security: []
+      parameters: [{$ref: "#/components/parameters/Id"}]
+      responses:
+        "200":
+          description: Status (no personal data)
+          content: {application/json: {example: {"status": "processing", "failure_reason": ""}}}
+        "404": {$ref: "#/components/responses/Error"}
   /l/{id}:
     get:
       tags: [Hosted pages & providers]
@@ -1558,6 +1712,36 @@ components:
       required: true
       content: {application/json: {example: {"permissions": ["balance:read"]}, schema: {$ref: "#/components/schemas/PermissionsBody"}}}
   responses:
+    AuditLogs:
+      description: One page of activity, newest first
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              has_more: {type: boolean}
+              next_cursor: {type: integer}
+              data:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: {type: integer}
+                    occurred_at: {type: string, format: date-time}
+                    actor_kind: {type: string}
+                    actor_id: {type: string}
+                    actor_label: {type: string}
+                    merchant_id: {type: string}
+                    action: {type: string, example: payouts.create}
+                    route: {type: string, example: /v1/payouts}
+                    resource_type: {type: string}
+                    resource_id: {type: string}
+                    outcome: {type: string, enum: [success, denied, rejected, rate_limited, error]}
+                    status: {type: integer}
+                    error_code: {type: string}
+                    ip: {type: string}
+                    details: {type: object, additionalProperties: {type: string}}
+                    hash: {type: string}
     PaymentLink:
       description: Payment link
       content:
@@ -1671,6 +1855,22 @@ components:
                     created_at: {type: string, format: date-time}
           example: {"data": [{"id": 1, "from_status": "", "to_status": "pending", "source": "merchant_api", "created_at": "2026-10-28T09:30:00Z"}, {"id": 2, "from_status": "pending", "to_status": "processing", "source": "merchant_api", "reason": "checkout opened", "provider": "telebirr", "created_at": "2026-10-28T09:30:01Z"}, {"id": 3, "from_status": "processing", "to_status": "succeeded", "source": "provider", "provider": "telebirr", "details": {"provider_status": "succeeded", "amount": 150000, "currency": "ETB"}, "created_at": "2026-10-28T09:31:12Z"}]}
   schemas:
+    Adjustment:
+      type: object
+      properties:
+        id: {type: string}
+        merchant_id: {type: string}
+        environment: {type: string}
+        currency: {type: string}
+        direction: {type: string, enum: [credit, debit]}
+        amount: {type: integer}
+        reason: {type: string}
+        status: {type: string, enum: [pending_approval, approved, rejected]}
+        requested_by: {type: string}
+        requested_at: {type: string, format: date-time}
+        decided_by: {type: string}
+        decided_at: {type: string, format: date-time}
+        decision_note: {type: string}
     MerchantSettings:
       type: object
       properties:

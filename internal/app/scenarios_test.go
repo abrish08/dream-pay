@@ -103,7 +103,7 @@ func TestScenarios(t *testing.T) {
 		s.expect(strings.Contains(page, "CBE Birr") && strings.Contains(page, "telebirr") && strings.Contains(page, "450.00"),
 			"page lists the methods and the amount")
 		s.step("hosted page shows 450.00 ETB and the available methods")
-		next := s.postForm(p["checkout_url"].(string), url.Values{"method": {"cbe_birr"}})
+		next := s.postForm(p["checkout_url"].(string), url.Values{"method": {"cbe_birr"}, "phone": {"0911234567"}})
 		s.c.checkout(next, true)
 		s.c.eventually("paid with CBE Birr", func() bool {
 			got := s.c.do("GET", "/v1/payments/"+p["id"].(string), key, "", nil, 200)

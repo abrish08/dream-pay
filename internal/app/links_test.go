@@ -61,7 +61,7 @@ func TestPaymentLinks(t *testing.T) {
 	pid := checkout[strings.LastIndex(checkout, "/")+1:]
 
 	// The customer picks telebirr and pays.
-	r, err := noFollow.PostForm(checkout, url.Values{"method": {"telebirr"}})
+	r, err := noFollow.PostForm(checkout, url.Values{"method": {"telebirr"}, "phone": {"0911234567"}})
 	if err != nil || r.StatusCode != 303 {
 		t.Fatalf("choose method: %v %v", r, err)
 	}

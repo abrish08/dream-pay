@@ -31,6 +31,7 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 func WriteError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err error) {
 	ae := apperror.From(err)
 	status := apperror.Status(ae.Kind)
+	reqctx.AuditError(r.Context(), ae.Code)
 	if status >= 500 {
 		log.Error("request failed", "path", r.URL.Path, "correlation_id", reqctx.CorrelationID(r.Context()), "err", err)
 	}

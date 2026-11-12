@@ -181,6 +181,13 @@ services:
       MODULES: risk
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_risk?sslmode=disable
 
+  audit:
+    <<: *service
+    environment:
+      <<: *micro-env
+      MODULES: audit
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/gw_audit?sslmode=disable
+
   dispute:
     <<: *service
     environment:
@@ -230,6 +237,11 @@ services:
         /pay=http://payment:8080,
         /v1/payment-methods=http://provider:8080,
         /admin/providers=http://provider:8080,
+        /admin/bank-transfers=http://provider:8080,
+        /v1/payment-links=http://payment:8080,
+        /v1/reports/payments.csv=http://payment:8080,
+        /v1/reports/statement.csv=http://ledger:8080,
+        /l=http://payment:8080,
         /v1/refunds=http://refund:8080,
         /v1/balance=http://ledger:8080,
         /admin/ledger=http://ledger:8080,
@@ -237,6 +249,8 @@ services:
         /v1/webhook-deliveries=http://webhook:8080,
         /admin/reconciliation=http://reconciliation:8080,
         /admin/risk=http://risk:8080,
+        /v1/audit-logs=http://audit:8080,
+        /admin/audit-logs=http://audit:8080,
         /v1/disputes=http://dispute:8080,
         /admin/disputes=http://dispute:8080,
         /admin/payments=http://payment:8080

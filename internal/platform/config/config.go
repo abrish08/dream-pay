@@ -78,6 +78,9 @@ type Config struct {
 	SMTPHost, SMTPPort, SMTPUsername, SMTPPassword, MailFrom string
 	DashboardURL                                             string        // where reset links point (your dashboard)
 	PasswordResetTTL                                         time.Duration // default 30m
+	AccessTokenTTL                                           time.Duration // AUTH_ACCESS_TOKEN_TTL, default 5m
+	AuditAllReads                                            bool          // AUDIT_ALL_READS: record every GET too
+	RefreshTokenTTL                                          time.Duration // AUTH_REFRESH_TOKEN_TTL, default 168h (7 days)
 	Mailer                                                   mail.Sender   // set directly by tests / embedders; overrides SMTP
 
 	// SMS through send.et (verification codes by SMS). Empty key = disabled.
@@ -107,6 +110,11 @@ type Config struct {
 	ProviderTestRoutes map[string][]string
 	// Mastercard Gateway (MPGS): live merchant and bank TEST merchant. nil = off.
 	MPGS, MPGSTest *MPGSSettings
+	// Wallet accounts (TELEBIRR_*, CBEBIRR_*, MPESA_* and their *_TEST_*).
+	Wallets []WalletSettings
+	// Manual bank transfer: BANK_TRANSFER_ACCOUNTS="CBE|1000123456789|Paygate PLC;Dashen Bank|5012...|Paygate PLC"
+	BankAccounts   [][3]string
+	BankCurrencies []string
 
 	PaymentTTL         time.Duration
 	PaymentExpiryEvery time.Duration // how often overdue payments are checked (default 15s)
@@ -205,9 +213,31 @@ func Load() (Config, error) {
 		}
 		c.PasswordResetTTL = d
 	}
+	// Dashboard sessions: a short access token (permissions and sign-out apply
+	// within this time) and a longer refresh token (how long a user stays
+	// signed in without activity; rotated on every use).
+	c.AccessTokenTTL, c.RefreshTokenTTL = 5*time.Minute, 7*24*time.Hour
+	if v := os.Getenv("AUTH_ACCESS_TOKEN_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < time.Minute || d > time.Hour {
+			return c, fmt.Errorf("AUTH_ACCESS_TOKEN_TTL must be a duration between 1m and 1h, e.g. 5m or 15m")
+		}
+		c.AccessTokenTTL = d
+	}
+	if v := os.Getenv("AUTH_REFRESH_TOKEN_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < time.Hour || d > 90*24*time.Hour {
+			return c, fmt.Errorf("AUTH_REFRESH_TOKEN_TTL must be a duration between 1h and 2160h (90 days), e.g. 12h or 168h")
+		}
+		c.RefreshTokenTTL = d
+	}
+	if c.RefreshTokenTTL <= c.AccessTokenTTL {
+		return c, fmt.Errorf("AUTH_REFRESH_TOKEN_TTL must be longer than AUTH_ACCESS_TOKEN_TTL")
+	}
 	c.SendEtAPIKey, c.SendEtSender = os.Getenv("SENDET_API_KEY"), env("SENDET_SENDER", "Paygate")
 	c.SendEtBaseURL = env("SENDET_BASE_URL", "https://api.send.et/v1")
 	c.HSTS = envBool("HSTS", false)
+	c.AuditAllReads = envBool("AUDIT_ALL_READS", false)
 	c.KYCStorage = env("KYC_STORAGE", "local")
 	c.KYCStorageDir = env("KYC_STORAGE_DIR", "./data/kyc")
 	c.MinIO = MinIOConfig{Endpoint: os.Getenv("MINIO_ENDPOINT"), PublicEndpoint: os.Getenv("MINIO_PUBLIC_ENDPOINT"),
@@ -243,6 +273,35 @@ func Load() (Config, error) {
 	if c.MPGSTest, err = mpgsFromEnv("MPGS_TEST_", "https://test-gateway.mastercard.com"); err != nil {
 		return c, err
 	}
+	for _, w := range []struct{ prefix, name, method string }{{"TELEBIRR", "telebirr", "telebirr"}, {"CBEBIRR", "cbebirr", "cbe_birr"},
+		{"MPESA", "mpesa", "mpesa"}} {
+		for _, test := range []bool{false, true} {
+			prefix, name := w.prefix+"_", w.name
+			if test {
+				prefix, name = w.prefix+"_TEST_", w.name+"_test"
+			}
+			ws := WalletSettings{Name: name, Method: w.method, BaseURL: os.Getenv(prefix + "BASE_URL"), APIKey: os.Getenv(prefix + "API_KEY"),
+				WebhookSecret: os.Getenv(prefix + "WEBHOOK_SECRET"), Currencies: list(env(prefix+"CURRENCIES", "ETB")), Sandbox: test}
+			if ws.BaseURL == "" && ws.APIKey == "" {
+				continue
+			}
+			if ws.BaseURL == "" || ws.APIKey == "" || ws.WebhookSecret == "" {
+				return c, fmt.Errorf("%sBASE_URL, %sAPI_KEY and %sWEBHOOK_SECRET go together", prefix, prefix, prefix)
+			}
+			c.Wallets = append(c.Wallets, ws)
+		}
+	}
+	for _, acc := range strings.Split(os.Getenv("BANK_TRANSFER_ACCOUNTS"), ";") {
+		if acc = strings.TrimSpace(acc); acc == "" {
+			continue
+		}
+		parts := strings.Split(acc, "|")
+		if len(parts) != 3 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "" {
+			return c, fmt.Errorf("BANK_TRANSFER_ACCOUNTS: %q must look like Bank|AccountNumber|AccountName", acc)
+		}
+		c.BankAccounts = append(c.BankAccounts, [3]string{strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), strings.TrimSpace(parts[2])})
+	}
+	c.BankCurrencies = list(env("BANK_TRANSFER_CURRENCIES", "ETB"))
 	c.PaymentTTL = 30 * time.Minute
 	if v := os.Getenv("PAYMENT_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
@@ -461,4 +520,11 @@ func parseRoutes(name string) (map[string][]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// WalletSettings: one wallet account (placeholder adapter until the API is signed).
+type WalletSettings struct {
+	Name, Method, BaseURL, APIKey, WebhookSecret string
+	Currencies                                   []string
+	Sandbox                                      bool
 }

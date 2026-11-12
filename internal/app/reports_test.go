@@ -44,7 +44,8 @@ func TestReports(t *testing.T) {
 	})
 	c.do("POST", "/v1/refunds", key, "rep-r", map[string]any{"payment_id": pid, "amount": 10000}, 201)
 	c.eventually("refund booked", func() bool {
-		return c.do("GET", "/v1/balance?currency=ETB", key, "", nil, 200)["available"] == float64(98500+49250-10000)
+		return c.do("GET", "/v1/balance?currency=ETB", key, "", nil, 200)["available"] == float64(98500+49250-10000) &&
+			c.do("GET", "/v1/payments/"+pid, key, "", nil, 200)["refunded_amount"] == float64(10000)
 	})
 
 	code, rows := c.csv(key, "/v1/reports/payments.csv")

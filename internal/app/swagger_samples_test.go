@@ -258,7 +258,7 @@ func (f *fixtures) callerFor(method, path string, open bool) string {
 	case strings.HasPrefix(path, "/admin"):
 		return f.c.admin
 	case strings.HasPrefix(path, "/auth"), strings.HasPrefix(path, "/v1/api-keys"), strings.HasPrefix(path, "/v1/team"),
-		strings.HasPrefix(path, "/v1/roles"), path == "/v1/permissions", path == "/v1/audit-log",
+		strings.HasPrefix(path, "/v1/roles"), path == "/v1/permissions", path == "/v1/audit-log", path == "/v1/audit-logs",
 		strings.HasPrefix(path, "/v1/payouts"), path == "/v1/merchant", strings.HasPrefix(path, "/v1/kyc"), strings.HasPrefix(path, "/v1/disputes"):
 		return f.owner
 	}

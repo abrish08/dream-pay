@@ -13,6 +13,7 @@ import (
 	"paygate/internal/contracts/ledger"
 	"paygate/internal/contracts/payments"
 	"paygate/internal/contracts/payouts"
+	"paygate/internal/contracts/reconciliation"
 	"paygate/internal/contracts/refunds"
 	"paygate/internal/modules/ledger/internal/domain"
 	"paygate/internal/modules/ledger/internal/store"
@@ -38,8 +39,16 @@ func New(db *gorm.DB, log *slog.Logger) *Service {
 func (s *Service) OnPaymentSucceeded(ctx context.Context, e bus.Envelope, evt payments.PaymentSucceeded) error {
 	return events.HandleOnce(ctx, s.db, "ledger.on_payment_succeeded", e, func(tx *gorm.DB) error {
 		posted, err := s.store.Post(tx, domain.PaymentCaptured(evt), s.now())
-		if err != nil || !posted || evt.Reserve <= 0 || evt.ReserveDays <= 0 {
+		if err != nil || !posted {
 			return err
+		}
+		if domain.IsBankTransfer(evt.Provider) { // the money is already in our bank
+			if _, err := s.store.Post(tx, domain.PaymentBanked(evt), s.now()); err != nil {
+				return err
+			}
+		}
+		if evt.Reserve <= 0 || evt.ReserveDays <= 0 {
+			return nil
 		}
 		reserve := min(evt.Reserve, max(evt.Amount-evt.Fee, 0))
 		if reserve <= 0 {
@@ -93,29 +102,170 @@ func (s *Service) ReleaseDue(ctx context.Context, limit int) (int, error) {
 	return n, err
 }
 
+// A dispute takes the money whatever the balance (the card network has
+// already taken it from us), so the balance may go below zero. Finance is
+// alerted; payouts stay blocked and new payments repay it first.
 func (s *Service) OnDisputeOpened(ctx context.Context, e bus.Envelope, evt disputes.DisputeOpened) error {
 	return events.HandleOnce(ctx, s.db, "ledger.on_dispute_opened", e, func(tx *gorm.DB) error {
-		_, err := s.store.Post(tx, domain.DisputeOpened(evt), s.now())
-		return err
+		if _, err := s.store.Post(tx, domain.DisputeOpened(evt), s.now()); err != nil {
+			return err
+		}
+		return s.warnIfNegative(tx, evt.MerchantID, evt.Environment, evt.Currency, "dispute opened "+evt.DisputeID)
 	})
 }
 
 func (s *Service) OnDisputeClosed(ctx context.Context, e bus.Envelope, evt disputes.DisputeClosed) error {
 	return events.HandleOnce(ctx, s.db, "ledger.on_dispute_closed", e, func(tx *gorm.DB) error {
-		_, err := s.store.Post(tx, domain.DisputeClosed(evt), s.now())
-		return err
+		if _, err := s.store.Post(tx, domain.DisputeClosed(evt), s.now()); err != nil {
+			return err
+		}
+		return s.warnIfNegative(tx, evt.MerchantID, evt.Environment, evt.Currency, "dispute closed "+evt.DisputeID)
 	})
+}
+
+// warnIfNegative logs an alert line when a merchant now owes the platform.
+func (s *Service) warnIfNegative(tx *gorm.DB, merchantID, env, currency, why string) error {
+	b, err := s.store.Balance(tx, domain.MerchantAvailable(merchantID, env), currency)
+	if err == nil && b < 0 {
+		s.log.Warn("merchant balance below zero", "alert", true, "merchant_id", merchantID, "environment", env,
+			"currency", currency, "balance", b, "cause", why)
+	}
+	return err
 }
 
 // GetBalance answers ledger.GetBalance.
 func (s *Service) GetBalance(ctx context.Context, q ledger.GetBalance) (ledger.Balance, error) {
 	b, err := s.MerchantBalance(ctx, q.MerchantID, q.Environment, q.Currency)
-	return ledger.Balance{Available: b.Available, Reserved: b.Reserved, DisputeHold: b.DisputeHold, PendingPayouts: b.PendingPayouts}, err
+	return ledger.Balance{Available: b.Available, Reserved: b.Reserved, DisputeHold: b.DisputeHold, PendingPayouts: b.PendingPayouts,
+		PendingRefunds: b.PendingRefunds}, err
+}
+
+// HoldRefund answers ledger.HoldRefund: the refund amount is held before
+// the refund reaches the provider. Atomic per merchant account.
+func (s *Service) HoldRefund(ctx context.Context, q ledger.HoldRefund) (ledger.Reservation, error) {
+	if q.Amount <= 0 || q.RefundID == "" || !money.Supported(q.Currency) {
+		return ledger.Reservation{}, apperror.Invalid("invalid_refund_hold", "refund_id, amount and currency are required")
+	}
+	// The payment's capture is booked from an event, a moment after the
+	// payment succeeded. A refund right after a payment waits for it rather
+	// than seeing a balance without that payment.
+	if err := s.waitForCapture(ctx, q.PaymentID); err != nil {
+		return ledger.Reservation{}, err
+	}
+	account := domain.MerchantAvailable(q.MerchantID, q.Environment)
+	var out ledger.Reservation
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := s.store.LockAccount(tx, account, q.Currency); err != nil {
+			return err
+		}
+		posting := domain.RefundHeld(q.RefundID, q.MerchantID, q.Environment, q.Currency, q.Amount)
+		done, err := s.store.Posted(tx, posting.Reference)
+		if err != nil {
+			return err
+		}
+		available, err := s.store.Balance(tx, account, q.Currency)
+		if err != nil {
+			return err
+		}
+		if done {
+			out.AvailableAfter = available
+			return nil
+		}
+		reserve, err := s.store.Balance(tx, domain.MerchantReserve(q.MerchantID, q.Environment), q.Currency)
+		if err != nil {
+			return err
+		}
+		if available+max(reserve, 0)+max(q.Allowance, 0) < q.Amount {
+			return ledger.ErrInsufficientForRefund.WithMessage(fmt.Sprintf(
+				"the available balance (%d) is too low for this refund (%d)", available, q.Amount))
+		}
+		if _, err := s.store.Post(tx, posting, s.now()); err != nil {
+			return err
+		}
+		out.AvailableAfter = available - q.Amount
+		if out.AvailableAfter < 0 {
+			s.log.Warn("merchant balance below zero", "alert", true, "merchant_id", q.MerchantID, "environment", q.Environment,
+				"currency", q.Currency, "balance", out.AvailableAfter, "cause", "refund "+q.RefundID)
+		}
+		return nil
+	})
+	return out, err
+}
+
+var errCaptureNotBooked = apperror.Unavailable("ledger_not_ready", "the payment is not in the books yet; the refund will be retried")
+
+func (s *Service) waitForCapture(ctx context.Context, paymentID string) error {
+	if paymentID == "" {
+		return nil
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		done, err := s.store.Posted(s.db.WithContext(ctx), ledger.PaymentReference(paymentID))
+		if err != nil || done {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errCaptureNotBooked // retryable: the refund stays pending
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func (s *Service) OnRefundSucceeded(ctx context.Context, e bus.Envelope, evt refunds.RefundSucceeded) error {
 	return events.HandleOnce(ctx, s.db, "ledger.on_refund_succeeded", e, func(tx *gorm.DB) error {
-		_, err := s.store.Post(tx, domain.RefundSucceeded(evt), s.now())
+		held, err := s.store.Posted(tx, domain.RefundHoldRef(evt.RefundID))
+		if err != nil {
+			return err
+		}
+		p := domain.RefundSucceeded(evt) // refunds made before holds existed
+		if held {
+			p = domain.RefundPaidFromHold(evt)
+		}
+		_, err = s.store.Post(tx, p, s.now())
+		return err
+	})
+}
+
+func (s *Service) OnRefundFailed(ctx context.Context, e bus.Envelope, evt refunds.RefundFailed) error {
+	return events.HandleOnce(ctx, s.db, "ledger.on_refund_failed", e, func(tx *gorm.DB) error {
+		return s.releaseRefund(tx, evt)
+	})
+}
+
+// ReleaseRefund answers ledger.ReleaseRefund (sent by the refund service as
+// soon as a provider declines, so a retry right after sees the money).
+func (s *Service) ReleaseRefund(ctx context.Context, q ledger.ReleaseRefund) (ledger.Reservation, error) {
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := s.store.LockAccount(tx, domain.MerchantAvailable(q.MerchantID, q.Environment), q.Currency); err != nil {
+			return err
+		}
+		return s.releaseRefund(tx, refunds.RefundFailed{RefundID: q.RefundID, PaymentID: q.PaymentID, MerchantID: q.MerchantID,
+			Environment: q.Environment, Amount: q.Amount, Currency: q.Currency, Reason: q.Reason})
+	})
+	return ledger.Reservation{}, err
+}
+
+func (s *Service) releaseRefund(tx *gorm.DB, evt refunds.RefundFailed) error {
+	held, err := s.store.Posted(tx, domain.RefundHoldRef(evt.RefundID))
+	if err != nil || !held {
+		return err // nothing was held: nothing to release
+	}
+	_, err = s.store.Post(tx, domain.RefundReleased(evt), s.now()) // once: unique reference
+	return err
+}
+
+// OnSettlementReconciled books the cash a provider paid into our bank.
+func (s *Service) OnSettlementReconciled(ctx context.Context, e bus.Envelope, evt reconciliation.SettlementReconciled) error {
+	return events.HandleOnce(ctx, s.db, "ledger.on_settlement_reconciled", e, func(tx *gorm.DB) error {
+		p := domain.SettlementBooked(evt)
+		if len(p.Lines) < 2 {
+			return nil // an empty report: nothing moved
+		}
+		_, err := s.store.Post(tx, p, s.now())
 		return err
 	})
 }
@@ -128,6 +278,7 @@ type BalanceView struct {
 	Reserved       int64  `json:"reserved"`        // rolling reserve, released on schedule
 	DisputeHold    int64  `json:"dispute_hold"`    // held for open disputes
 	PendingPayouts int64  `json:"pending_payouts"` // held for payouts not sent yet
+	PendingRefunds int64  `json:"pending_refunds"` // held for refunds being processed
 }
 
 // ReserveFunds holds funds for a payout. The per-account lock makes the
@@ -201,8 +352,12 @@ func (s *Service) MerchantBalance(ctx context.Context, merchantID, env, currency
 		return BalanceView{}, err
 	}
 	disputed, err := s.store.Balance(q, domain.MerchantDisputeHold(merchantID, env), currency)
+	if err != nil {
+		return BalanceView{}, err
+	}
+	refunding, err := s.store.Balance(q, domain.MerchantRefundsPending(merchantID, env), currency)
 	return BalanceView{MerchantID: merchantID, Environment: env, Currency: currency, Available: v, Reserved: reserved,
-		DisputeHold: disputed, PendingPayouts: held}, err
+		DisputeHold: disputed, PendingPayouts: held, PendingRefunds: refunding}, err
 }
 
 func (s *Service) TrialBalance(ctx context.Context) ([]store.TrialBalanceRow, error) {

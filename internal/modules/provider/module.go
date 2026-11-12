@@ -41,6 +41,19 @@ type Deps struct {
 	// Mastercard Gateway (MPGS) card acquiring: the live merchant and,
 	// optionally, the bank's TEST merchant for test mode. nil = not installed.
 	MPGS, MPGSTest *MPGSConfig
+
+	// Wallets (placeholder adapters until each provider's API is signed) and
+	// manual bank transfer accounts (empty = not offered).
+	Wallets        []WalletConfig
+	BankAccounts   []providers.BankAccount
+	BankCurrencies []string
+}
+
+// WalletConfig: one wallet account (live or the provider's sandbox).
+type WalletConfig struct {
+	Name, Method, BaseURL, APIKey, WebhookSecret string
+	Currencies                                   []string
+	Sandbox                                      bool
 }
 
 // MPGSConfig: credentials from the acquiring bank (see docs/providers.md).
@@ -105,6 +118,22 @@ func New(d Deps) (*Module, error) {
 			}
 			return nil
 		})
+	}
+
+	for _, w := range d.Wallets {
+		g, err := gateway.NewWallet(gateway.WalletConfig{Name: w.Name, Method: w.Method, BaseURL: w.BaseURL, APIKey: w.APIKey,
+			WebhookSecret: w.WebhookSecret, Currencies: w.Currencies, Sandbox: w.Sandbox, PublicBaseURL: d.PublicBaseURL})
+		if err != nil {
+			return nil, err
+		}
+		base.Log.Warn("wallet adapter is a PLACEHOLDER (mock API); replace it with the provider's official API before live use",
+			"provider", w.Name)
+		others = append(others, g)
+	}
+	if len(d.BankAccounts) > 0 {
+		others = append(others,
+			gateway.NewBankTransfer("bank_transfer", false, d.BankAccounts, d.BankCurrencies, d.PublicBaseURL, st),
+			gateway.NewBankTransfer("bank_transfer_test", true, d.BankAccounts, d.BankCurrencies, d.PublicBaseURL, st))
 	}
 
 	for method, names := range mergeRoutes(d.Routes, d.TestRoutes) {

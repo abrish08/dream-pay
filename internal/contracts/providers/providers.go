@@ -106,10 +106,44 @@ type InitiateCheckout struct {
 	Currency      string `json:"currency"`
 	CustomerEmail string `json:"customer_email"`
 	CustomerName  string `json:"customer_name"`
+	CustomerPhone string `json:"customer_phone,omitempty"` // +2519...: wallets push the PIN prompt to it
 	ReturnURL     string `json:"return_url"`
 }
 
 func (InitiateCheckout) Route() string { return "providers.initiate_checkout" }
+
+// Instructions: what the customer must do themselves (bank transfer:
+// accounts and the reference to write on the transfer).
+type GetInstructions struct {
+	bus.Returns[Instructions]
+	TxRef string `json:"tx_ref"`
+}
+
+type Instructions struct {
+	Kind      string        `json:"kind"`      // bank_transfer, or "" when the provider needs nothing
+	Reference string        `json:"reference"` // write this on the transfer
+	Accounts  []BankAccount `json:"accounts,omitempty"`
+}
+
+type BankAccount struct {
+	Bank          string `json:"bank"`
+	AccountNumber string `json:"account_number"`
+	AccountName   string `json:"account_name"`
+}
+
+func (GetInstructions) Route() string { return "providers.get_instructions" }
+
+// Wallet methods: the customer approves a push on their phone.
+var WalletMethods = []string{MethodTelebirr, MethodCBEBirr, MethodMPesa}
+
+func IsWallet(method string) bool {
+	for _, m := range WalletMethods {
+		if m == method {
+			return true
+		}
+	}
+	return false
+}
 
 // ListMethods returns the payment methods that can be used right now.
 type ListMethods struct {
@@ -171,9 +205,15 @@ type TransactionUpdated struct {
 func (TransactionUpdated) EventTopic() string { return TopicTransactionUpdated }
 
 // Permissions checked by the provider service (registered with auth at start-up).
-const PermRead = "providers:read" // platform: provider health and routing
+const (
+	PermRead = "providers:read" // platform: provider health and routing
+	// PermConfirmTransfers: finance confirms bank transfers seen on the bank statement.
+	PermConfirmTransfers = "providers:confirm_transfers"
+)
 
 var Permissions = []auth.PermissionDef{
+	{Code: PermConfirmTransfers, Description: "Confirm customers' bank transfers from the bank statement", Audience: auth.AudiencePlatform,
+		DefaultRoles: []string{auth.RoleFinance}},
 	{Code: PermRead, Description: "View payment providers, routing and health", Audience: auth.AudiencePlatform,
 		DefaultRoles: []string{auth.RoleOperations, auth.RoleFinance, auth.RoleSupport}},
 }

@@ -24,8 +24,19 @@
 | Forgot password | `POST /auth/password/forgot` → email → `POST /auth/password/reset` | always 202; single-use 256-bit token, 30 min; 3 emails/hour |
 | Change password | `POST /auth/password` `{current_password, new_password, totp_code}` | **requires an authenticator code** |
 
-Every completed sign-in returns an **access token** (JWT, 5 min, carries roles
-and permissions) and a **refresh token** (7 days, stored hashed, rotated).
+Every completed sign-in returns an **access token** (JWT, carries roles and
+permissions) and a **refresh token** (stored hashed, rotated on every use).
+Their lifetimes come from `.env`:
+
+| Setting | Default | Allowed | Meaning |
+|---|---|---|---|
+| `AUTH_ACCESS_TOKEN_TTL` | `5m` | 1m to 1h | role changes and sign-out take effect within this time |
+| `AUTH_REFRESH_TOKEN_TTL` | `168h` (7 days) | 1h to 2160h | how long someone stays signed in without signing in again |
+
+The dashboard refreshes once for all requests that arrive together (a used
+refresh token is never sent twice, which would sign the user out everywhere)
+and treats only token errors as "signed out"; a wrong authenticator code is
+shown as an error on the page.
 
 #### Account verification (6-digit code)
 

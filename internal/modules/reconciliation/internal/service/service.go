@@ -17,11 +17,13 @@ import (
 	"paygate/internal/contracts/ledger"
 	"paygate/internal/contracts/payments"
 	"paygate/internal/contracts/providers"
+	"paygate/internal/contracts/reconciliation"
 	"paygate/internal/contracts/refunds"
 	"paygate/internal/modules/reconciliation/internal/domain"
 	"paygate/internal/modules/reconciliation/internal/store"
 	"paygate/internal/platform/apperror"
 	"paygate/internal/platform/bus"
+	"paygate/internal/platform/events"
 	"paygate/internal/platform/money"
 )
 
@@ -50,15 +52,16 @@ type Options struct {
 }
 
 type Service struct {
-	db    *gorm.DB
-	store *store.Store
-	bus   bus.Bus // the only way to reach other modules
-	opt   Options
-	log   *slog.Logger
-	now   func() time.Time
+	db     *gorm.DB
+	store  *store.Store
+	bus    bus.Bus          // the only way to reach other modules
+	events events.Publisher // SettlementReconciled, for the ledger
+	opt    Options
+	log    *slog.Logger
+	now    func() time.Time
 }
 
-func New(db *gorm.DB, b bus.Bus, opt Options, log *slog.Logger) *Service {
+func New(db *gorm.DB, b bus.Bus, pub events.Publisher, opt Options, log *slog.Logger) *Service {
 	if opt.Location == nil {
 		opt.Location, _ = time.LoadLocation("Africa/Addis_Ababa")
 	}
@@ -71,7 +74,7 @@ func New(db *gorm.DB, b bus.Bus, opt Options, log *slog.Logger) *Service {
 	if opt.SettleWait == 0 {
 		opt.SettleWait = 2 * time.Minute
 	}
-	return &Service{db: db, store: store.New(), bus: b, opt: opt, log: log,
+	return &Service{events: pub, db: db, store: store.New(), bus: b, opt: opt, log: log,
 		now: func() time.Time { return time.Now().UTC() }}
 }
 
@@ -582,7 +585,35 @@ func (c *checker) settlement(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	return c.bookSettlement(ctx, st, ours)
+}
+
+// bookSettlement tells the ledger what reached the bank, per currency.
+// Re-running the check is safe: the ledger books each settlement once.
+func (c *checker) bookSettlement(ctx context.Context, st *store.Settlement, ours map[string]payments.Payment) error {
+	env := "live"
+	if strings.HasSuffix(st.Provider, "_test") || strings.HasSuffix(st.Provider, "_sandbox") {
+		env = "test"
+	}
+	for _, p := range ours { // the payments say which environment the provider served
+		env = p.Environment
+		break
+	}
+	now := c.s.now()
+	return c.s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for cur, t := range c.sum.Settled {
+			deposit := t.Net
+			if st.DepositAmount != nil && st.DepositCurrency != nil && *st.DepositCurrency == cur {
+				deposit = *st.DepositAmount
+			}
+			evt := reconciliation.SettlementReconciled{SettlementID: st.ID, Provider: st.Provider, Environment: env, Currency: cur,
+				Gross: t.Amount, Refunds: t.Refunded, ProviderFees: t.Fees, Deposit: deposit, OccurredAt: now}
+			if err := c.s.events.Publish(ctx, tx, evt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // refunds: refund lines of the report against our refunds, and our

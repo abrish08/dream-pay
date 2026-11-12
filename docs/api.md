@@ -34,7 +34,11 @@ missing from the spec.
 | POST | `/v1/refunds` (+ `Idempotency-Key`) | `refunds:write` | refund |
 | GET | `/v1/refunds/{id}` | `payments:read` | refund |
 | GET | `/v1/balance?currency=ETB[&environment=test]` | `balance:read` | ledger |
-| GET | `/admin/ledger/trial-balance` | staff, `ledger:read` | ledger |
+| GET | `/admin/ledger/trial-balance`, `/admin/ledger/summary`, `/admin/ledger/adjustments` | staff, `ledger:read` | ledger |
+| POST | `/admin/ledger/adjustments` (request a correction) | staff, `ledger:adjust` | ledger |
+| POST | `/admin/ledger/adjustments/{id}/approve`, `/reject` (not your own) | staff, `ledger:approve` | ledger |
+| GET | `/v1/audit-logs` (your business only) | merchant user, `audit:read` | audit |
+| GET | `/admin/audit-logs[?merchant_id=]`, `/admin/audit-logs/verify` | staff, `audit:read_all` | audit |
 | POST, GET, DELETE | `/v1/webhook-endpoints[/{id}]`, GET `/v1/webhook-deliveries` | `webhooks:write` | webhook |
 | POST, GET | `/admin/reconciliation/runs[/{id}]` | staff, `reconciliation:run` | reconciliation |
 | GET, POST | `/providers/{name}/callback`, `/providers/mock/checkout/{txRef}` | verified per provider | provider |

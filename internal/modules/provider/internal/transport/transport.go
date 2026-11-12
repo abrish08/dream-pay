@@ -184,7 +184,34 @@ func (h *HTTP) RegisterPublic(r chi.Router) {
 }
 
 // RegisterAdmin: GET /admin/providers, adapters, routing and health.
+//
+//	GET  /admin/bank-transfers?reference=PG...      transfers waiting for the money (providers:confirm_transfers)
+//	POST /admin/bank-transfers/{paymentId}/confirm   {amount, bank_reference}: seen on the bank statement
 func (h *HTTP) RegisterAdmin(r chi.Router) {
+	r.With(httpx.Require(providers.PermConfirmTransfers, h.log)).Get("/bank-transfers", func(w http.ResponseWriter, r *http.Request) {
+		out, err := h.svc.PendingTransfers(r.Context(), r.URL.Query().Get("reference"), httpx.QueryInt(r, "limit", 50, 500))
+		if err != nil {
+			httpx.WriteError(w, r, h.log, err)
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"data": out})
+	})
+	r.With(httpx.Require(providers.PermConfirmTransfers, h.log)).Post("/bank-transfers/{paymentId}/confirm", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Amount        int64  `json:"amount"`
+			BankReference string `json:"bank_reference"`
+		}
+		if err := httpx.DecodeJSON(r, &body); err != nil {
+			httpx.WriteError(w, r, h.log, err)
+			return
+		}
+		t, err := h.svc.ConfirmTransfer(r.Context(), chi.URLParam(r, "paymentId"), body.Amount, body.BankReference, httpx.Principal(r).Subject)
+		if err != nil {
+			httpx.WriteError(w, r, h.log, err)
+			return
+		}
+		httpx.WriteJSON(w, http.StatusOK, t)
+	})
 	r.With(httpx.Require(providers.PermRead, h.log)).Get("/providers", func(w http.ResponseWriter, r *http.Request) {
 		live, _ := h.svc.ListMethods(r.Context(), providers.ListMethods{Environment: "live", Currency: "ETB"})
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"providers": h.svc.Health(), "live_routes_etb": live})
@@ -195,6 +222,7 @@ func (h *HTTP) RegisterAdmin(r chi.Router) {
 func RegisterBus(b bus.Bus, svc *service.Service) {
 	bus.Handle(b, svc.InitiateCheckout)
 	bus.Handle(b, svc.ListMethods)
+	bus.Handle(b, svc.Instructions)
 	bus.Handle(b, svc.Refund)
 	bus.Handle(b, func(ctx context.Context, q providers.VerifyTransaction) (providers.Transaction, error) {
 		return svc.VerifyTransaction(ctx, q.Provider, q.TxRef)

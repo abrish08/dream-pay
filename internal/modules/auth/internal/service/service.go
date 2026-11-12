@@ -152,6 +152,7 @@ func (s *Service) Login(ctx context.Context, email, password string) (Tokens, er
 			return err
 		}
 		now := s.now()
+		reqctx.AuditMerchant(ctx, u.MerchantID) // the business sees attempts on its accounts
 		if u.Locked(now) {
 			outcome = errLocked
 			return nil
@@ -205,6 +206,7 @@ func (s *Service) tokens(ctx context.Context, u *domain.User, refresh string, re
 		return Tokens{}, err
 	}
 	p.MFA = mfa
+	reqctx.AuditActor(ctx, p, u.Email) // sign-in, verification, refresh: who it was
 	access, _, err := s.cfg.Signer.Issue(p, s.cfg.AccessTTL)
 	if err != nil {
 		return Tokens{}, err

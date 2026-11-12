@@ -64,6 +64,7 @@ func (a *Auth) Middleware(next http.Handler) http.Handler {
 			WriteError(w, r, a.Log, err)
 			return
 		}
+		reqctx.AuditActor(r.Context(), p, "")
 		ctx := reqctx.WithToken(reqctx.WithPrincipal(r.Context(), p), token)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

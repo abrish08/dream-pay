@@ -9,13 +9,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"gorm.io/gorm"
 
 	"paygate/internal/app/apidocs"
+	auditc "paygate/internal/contracts/audit"
 	authc "paygate/internal/contracts/auth"
+	"paygate/internal/contracts/providers"
+	"paygate/internal/modules/audit"
 	"paygate/internal/modules/auth"
 	"paygate/internal/modules/dispute"
 	"paygate/internal/modules/kyc"
@@ -29,6 +33,7 @@ import (
 	"paygate/internal/modules/risk"
 	"paygate/internal/modules/webhook"
 	"paygate/internal/platform/apperror"
+	"paygate/internal/platform/auditlog"
 	"paygate/internal/platform/authn"
 	"paygate/internal/platform/bus"
 	"paygate/internal/platform/config"
@@ -44,7 +49,7 @@ import (
 // Modules is the list of every module in the system.
 var Modules = []string{
 	merchant.Name, auth.Name, provider.Name, payment.Name,
-	refund.Name, ledger.Name, webhook.Name, reconciliation.Name, payout.Name, kyc.Name, risk.Name, dispute.Name,
+	refund.Name, ledger.Name, webhook.Name, reconciliation.Name, payout.Name, kyc.Name, risk.Name, dispute.Name, audit.Name,
 }
 
 type App struct {
@@ -56,6 +61,9 @@ type App struct {
 	modules  []module.Module
 	dbs      []*gorm.DB
 	router   chi.Router
+	// audit: every process records who did what and sends it to the audit service.
+	audit     *auditlog.Recorder
+	stopAudit context.CancelFunc
 }
 
 func Build(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *App, err error) {
@@ -88,8 +96,9 @@ func Build(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *App, er
 
 	// Every process (not just one replica) learns about role and permission
 	// changes, so tokens issued before the change stop working everywhere.
-	// A process that starts later replays the last 15 minutes (> token TTL).
-	bus.OnEach(a.bus, 15*time.Minute, func(_ context.Context, e authc.AccessChanged) error {
+	// A process that starts later replays the last 15 minutes, or longer than
+	// the access-token lifetime when that is longer.
+	bus.OnEach(a.bus, max(15*time.Minute, cfg.AccessTokenTTL+time.Minute), func(_ context.Context, e authc.AccessChanged) error {
 		a.verifier.Revoke(e.UserIDs, e.RoleIDs, e.NotBefore)
 		return nil
 	})
@@ -105,6 +114,10 @@ func Build(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *App, er
 		a.modules = append(a.modules, m)
 	}
 
+	a.audit = auditlog.NewRecorder(func(ctx context.Context, e auditlog.Entry) error {
+		_, err := bus.Ask(ctx, a.bus, auditc.Record{Entry: e})
+		return err
+	}, auditSource(), 10_000, a.log)
 	a.router = a.buildRouter()
 	for _, m := range a.modules {
 		m.RegisterHandlers(a.bus)
@@ -129,7 +142,7 @@ func (a *App) newModule(name string) (module.Module, error) {
 			BootstrapEmail: cfg.BootstrapAdminEmail, BootstrapPassword: cfg.BootstrapAdminPassword,
 			BootstrapName: cfg.BootstrapAdminName, MerchantDefaultPermissions: cfg.MerchantDefaultPermissions,
 			Identity: a.identityProviders(), Mailer: a.mailer(), SMS: a.sms(), Box: a.box(), DashboardURL: cfg.DashboardURL,
-			ResetTTL: cfg.PasswordResetTTL}), nil
+			ResetTTL: cfg.PasswordResetTTL, AccessTTL: cfg.AccessTokenTTL, RefreshTTL: cfg.RefreshTokenTTL}), nil
 	case provider.Name:
 		conv := func(m *config.MPGSSettings) *provider.MPGSConfig {
 			if m == nil {
@@ -141,11 +154,13 @@ func (a *App) newModule(name string) (module.Module, error) {
 		}
 		return provider.New(provider.Deps{DB: db, Bus: b, Log: log, PublicBaseURL: cfg.PublicBaseURL,
 			Routes: cfg.ProviderRoutes, TestRoutes: cfg.ProviderTestRoutes, AllowMockInLive: cfg.AllowMockInLive,
-			MPGS: conv(cfg.MPGS), MPGSTest: conv(cfg.MPGSTest)})
+			MPGS: conv(cfg.MPGS), MPGSTest: conv(cfg.MPGSTest), Wallets: wallets(cfg.Wallets),
+			BankAccounts: bankAccounts(cfg.BankAccounts), BankCurrencies: cfg.BankCurrencies})
 	case payment.Name:
 		return payment.New(payment.Deps{DB: db, Bus: b, Log: log, AllowMockInLive: cfg.AllowMockInLive,
 			PaymentTTL: cfg.PaymentTTL, ExpiryEvery: cfg.PaymentExpiryEvery, PublicBaseURL: cfg.PublicBaseURL,
-			CheckEvery: cfg.PaymentCheckEvery, CheckSchedule: cfg.PaymentCheckSchedule, TrustProxy: cfg.TrustProxy}), nil
+			CheckEvery: cfg.PaymentCheckEvery, CheckSchedule: cfg.PaymentCheckSchedule, TrustProxy: cfg.TrustProxy,
+			Mailer: a.mailer(), SMS: a.sms()}), nil
 	case refund.Name:
 		return refund.New(refund.Deps{DB: db, Bus: b, Log: log}), nil
 	case ledger.Name:
@@ -163,6 +178,8 @@ func (a *App) newModule(name string) (module.Module, error) {
 			FaydaRedirectURI: cfg.FaydaRedirectURI, FaydaACR: cfg.FaydaACR})
 	case dispute.Name:
 		return dispute.New(dispute.Deps{DB: db, Bus: b, Log: log, DeadlineEvery: cfg.DisputeDeadlineEvery}), nil
+	case audit.Name:
+		return audit.New(audit.Deps{DB: db, Bus: b, Log: log}), nil
 	case risk.Name:
 		return risk.New(risk.Deps{DB: db, Bus: b, Log: log}), nil
 	case payout.Name:
@@ -244,7 +261,9 @@ func (a *App) buildAuth() error {
 
 func (a *App) buildRouter() chi.Router {
 	r := chi.NewRouter()
-	r.Use(httpx.Correlation, httpx.Recoverer(a.log), httpx.AccessLog(a.log), httpx.CORS(a.cfg.CORSOrigins),
+	r.Use(httpx.Correlation,
+		httpx.Audit(httpx.AuditOptions{Recorder: a.audit, TrustProxy: a.cfg.TrustProxy, AllReads: a.cfg.AuditAllReads}),
+		httpx.Recoverer(a.log), httpx.AccessLog(a.log), httpx.CORS(a.cfg.CORSOrigins),
 		httpx.SecurityHeaders(a.cfg.HSTS))
 	notFound := func(w http.ResponseWriter, req *http.Request) {
 		httpx.WriteError(w, req, a.log, apperror.NotFound("route_not_found", "no route for "+req.Method+" "+req.URL.Path))
@@ -362,10 +381,17 @@ func (a *App) Start(ctx context.Context) error {
 			return fmt.Errorf("start %s: %w", m.Name(), err)
 		}
 	}
+	actx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	a.stopAudit = cancel
+	go a.audit.Run(actx)
 	return nil
 }
 
 func (a *App) Stop(ctx context.Context) {
+	if a.stopAudit != nil { // deliver queued audit entries while the bus is still up
+		a.stopAudit()
+		a.audit.Wait()
+	}
 	for i := len(a.modules) - 1; i >= 0; i-- {
 		if err := a.modules[i].Stop(ctx); err != nil {
 			a.log.Warn("module stop", "module", a.modules[i].Name(), "err", err)
@@ -383,4 +409,29 @@ func (a *App) closeResources() {
 			_ = sqlDB.Close()
 		}
 	}
+}
+
+func wallets(ws []config.WalletSettings) []provider.WalletConfig {
+	out := make([]provider.WalletConfig, len(ws))
+	for i, w := range ws {
+		out[i] = provider.WalletConfig{Name: w.Name, Method: w.Method, BaseURL: w.BaseURL, APIKey: w.APIKey,
+			WebhookSecret: w.WebhookSecret, Currencies: w.Currencies, Sandbox: w.Sandbox}
+	}
+	return out
+}
+
+func bankAccounts(as [][3]string) []providers.BankAccount {
+	out := make([]providers.BankAccount, len(as))
+	for i, a := range as {
+		out[i] = providers.BankAccount{Bank: a[0], AccountNumber: a[1], AccountName: a[2]}
+	}
+	return out
+}
+
+// auditSource names this process in audit entries (the host or container).
+func auditSource() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "paygate"
 }

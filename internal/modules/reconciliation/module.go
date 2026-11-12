@@ -54,7 +54,7 @@ func New(d Deps) (*Module, error) {
 		}
 		opt.Location = loc
 	}
-	m := &Module{Base: base, svc: service.New(d.DB, d.Bus, opt, base.Log)}
+	m := &Module{Base: base, svc: service.New(d.DB, d.Bus, base.Events, opt, base.Log)}
 	m.AddWorker(m.svc.Worker)
 	return m, nil
 }

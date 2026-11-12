@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"gorm.io/gorm"
+
 	"paygate/internal/platform/config"
 )
 
@@ -73,11 +75,23 @@ func TestReconciliation(t *testing.T) {
 	if err := db.Exec("UPDATE payment.payments SET status = 'failed', failure_reason = 'timeout' WHERE id = ?", d).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Exec(`DELETE FROM ledger.ledger_entries WHERE transaction_id IN
-		(SELECT id FROM ledger.ledger_transactions WHERE reference = ?)`, "payment:"+cc+":captured").Error; err != nil {
-		t.Fatal(err)
+	// The ledger refuses deletes; plain DELETE fails:
+	if err := db.Exec("DELETE FROM ledger.ledger_transactions WHERE reference = ?", "payment:"+cc+":captured").Error; err == nil ||
+		!strings.Contains(err.Error(), "append-only") {
+		t.Fatalf("ledger delete must be refused, got %v", err)
 	}
-	if err := db.Exec("DELETE FROM ledger.ledger_transactions WHERE reference = ?", "payment:"+cc+":captured").Error; err != nil {
+	// Simulate a booking that never happened: only a database superuser
+	// can switch the protection off (the application must not run as one).
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SET LOCAL session_replication_role = replica").Error; err != nil {
+			return err
+		}
+		if err := tx.Exec(`DELETE FROM ledger.ledger_entries WHERE transaction_id IN
+			(SELECT id FROM ledger.ledger_transactions WHERE reference = ?)`, "payment:"+cc+":captured").Error; err != nil {
+			return err
+		}
+		return tx.Exec("DELETE FROM ledger.ledger_transactions WHERE reference = ?", "payment:"+cc+":captured").Error
+	}); err != nil {
 		t.Fatal(err)
 	}
 

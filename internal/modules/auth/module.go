@@ -48,6 +48,8 @@ type Deps struct {
 	Mailer       mail.Sender
 	DashboardURL string
 	ResetTTL     time.Duration
+	AccessTTL    time.Duration // user access tokens (AUTH_ACCESS_TOKEN_TTL)
+	RefreshTTL   time.Duration // user refresh tokens (AUTH_REFRESH_TOKEN_TTL)
 }
 
 type Module struct {
@@ -71,6 +73,7 @@ func New(d Deps) *Module {
 		BootstrapName:              d.BootstrapName,
 		MerchantDefaultPermissions: d.MerchantDefaultPermissions,
 		Identity:                   d.Identity, Box: d.Box, SMS: d.SMS, Mailer: d.Mailer, DashboardURL: d.DashboardURL, ResetTTL: d.ResetTTL,
+		AccessTTL: d.AccessTTL, RefreshTTL: d.RefreshTTL,
 	}
 	if len(d.PreviousPepper) > 0 {
 		cfg.PreviousPepper = &domain.Pepper{Version: d.PepperVersion - 1, Secret: d.PreviousPepper}

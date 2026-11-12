@@ -25,8 +25,10 @@ import (
 	"paygate/internal/platform/apperror"
 	"paygate/internal/platform/bus"
 	"paygate/internal/platform/events"
+	"paygate/internal/platform/mail"
 	"paygate/internal/platform/metrics"
 	"paygate/internal/platform/money"
+	"paygate/internal/platform/sms"
 )
 
 type Service struct {
@@ -44,6 +46,7 @@ type Service struct {
 	// CheckSchedule: when open payments are checked with the provider, as
 	// delays from the previous check (the first from when the checkout opened).
 	CheckSchedule []time.Duration
+	notify        Notifiers
 	log           *slog.Logger
 	now           func() time.Time
 }
@@ -83,6 +86,8 @@ func New(db *gorm.DB, pub events.Publisher, b bus.Bus, allowMockInLive bool, ttl
 		CheckSchedule: DefaultCheckSchedule,
 		log:           log, now: func() time.Time { return time.Now().UTC() }}
 }
+
+var errPhoneRequired = apperror.Invalid("phone_required", "enter the phone number of the wallet that pays")
 
 // DefaultCheckSchedule: a payment still open is checked 1, 3, 8, 18, 38 and
 // 68 minutes after its checkout opened (then the expiry check takes over), so
@@ -263,8 +268,13 @@ func (s *Service) start(ctx context.Context, p *domain.Payment, source string) (
 	res, err := bus.Ask(ctx, s.bus, providers.InitiateCheckout{
 		Method: p.PaymentMethod, Provider: p.Provider, Environment: p.Environment, TxRef: p.ID,
 		Amount: p.Amount, Currency: p.Currency, CustomerEmail: p.CustomerEmail, CustomerName: p.CustomerName,
-		ReturnURL: p.ReturnURL,
+		CustomerPhone: p.CustomerPhone, ReturnURL: p.ReturnURL,
 	})
+	if err != nil && apperror.From(err).Code == "phone_required" {
+		// The wallet needs the customer's number: nothing was sent. The
+		// customer enters it on our checkout page, then the push starts.
+		return s.askForPhone(ctx, p)
+	}
 	if err != nil {
 		if notStarted(err) {
 			reason := "provider_initiation_failed: " + apperror.From(err).Message
@@ -303,6 +313,27 @@ func (s *Service) start(ctx context.Context, p *domain.Payment, source string) (
 	return p, err
 }
 
+// askForPhone keeps the payment open and points it at the hosted checkout,
+// which asks for the wallet number.
+func (s *Service) askForPhone(ctx context.Context, p *domain.Payment) (*domain.Payment, error) {
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		cur, err := s.store.Get(tx, p.ID, true)
+		if err != nil {
+			return err
+		}
+		if cur.Status == domain.Pending && cur.CheckoutURL == "" {
+			cur.CheckoutURL, cur.UpdatedAt = s.publicBase+"/pay/"+cur.ID, s.now()
+			cur.Note("waiting for the customer's phone number", s.now())
+			if err := s.store.Save(tx, cur, domain.Actor{Source: domain.SourceSystem}); err != nil {
+				return err
+			}
+		}
+		p = cur
+		return nil
+	})
+	return p, err
+}
+
 // notStarted: the error proves nothing was started at any provider, so the
 // payment can safely be failed.
 func notStarted(err error) bool {
@@ -317,7 +348,7 @@ func notStarted(err error) bool {
 // ChooseMethod: the customer picked a method on the hosted page. Returns the
 // provider's checkout URL to redirect to. A second submit (double click,
 // another tab) gets the same checkout instead of a second charge.
-func (s *Service) ChooseMethod(ctx context.Context, id, method string) (string, error) {
+func (s *Service) ChooseMethod(ctx context.Context, id, method, phone string) (string, error) {
 	var p *domain.Payment
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
@@ -329,6 +360,16 @@ func (s *Service) ChooseMethod(ctx context.Context, id, method string) (string, 
 		}
 		if err := p.ChooseMethod(method, s.now()); err != nil {
 			return err
+		}
+		if providers.IsWallet(method) {
+			if phone != "" {
+				if err := p.SetPhone(phone, s.now()); err != nil {
+					return err
+				}
+			}
+			if p.CustomerPhone == "" {
+				return errPhoneRequired
+			}
 		}
 		p.Note("method chosen: "+method, s.now())
 		return s.store.Save(tx, p, domain.Actor{Source: domain.SourceCustomer})
@@ -342,22 +383,30 @@ func (s *Service) ChooseMethod(ctx context.Context, id, method string) (string, 
 	if p, err = s.start(ctx, p, domain.SourceCustomer); err != nil {
 		return "", err
 	}
+	if p.Status == domain.Pending { // the provider still needs the phone
+		return "", errPhoneRequired
+	}
 	return p.CheckoutURL, nil // empty when the outcome is being checked: the page shows the status
 }
 
 // CheckoutView is what the hosted page shows.
 type CheckoutView struct {
-	ID          string
-	Merchant    string
-	Amount      int64
-	Currency    string
-	Description string
-	Reference   string
-	Status      string
-	Open        bool
-	ExpiresAt   time.Time
-	ReturnURL   string
-	Methods     []providers.MethodInfo
+	ID            string
+	Merchant      string
+	Amount        int64
+	Currency      string
+	Description   string
+	Reference     string
+	Status        string
+	Open          bool // the customer can still choose how to pay
+	ExpiresAt     time.Time
+	ReturnURL     string
+	Methods       []providers.MethodInfo
+	Method        string // chosen or set by the merchant
+	PhoneKnown    bool
+	PhoneMasked   string // +251 9** *** 567
+	FailureReason string
+	Instructions  providers.Instructions // bank transfer: accounts and reference
 }
 
 func (s *Service) Checkout(ctx context.Context, id string) (CheckoutView, error) {
@@ -367,7 +416,8 @@ func (s *Service) Checkout(ctx context.Context, id string) (CheckoutView, error)
 	}
 	v := CheckoutView{ID: p.ID, Amount: p.Amount, Currency: p.Currency, Description: p.Description,
 		Reference: p.Reference, Status: string(p.Status), ExpiresAt: p.ExpiresAt, ReturnURL: p.ReturnURL,
-		Open: p.Status == domain.Pending && s.now().Before(p.ExpiresAt)}
+		Open: p.Status == domain.Pending && s.now().Before(p.ExpiresAt), Method: p.PaymentMethod,
+		PhoneKnown: p.CustomerPhone != "", PhoneMasked: maskPhone(p.CustomerPhone), FailureReason: p.FailureReason}
 	if m, err := bus.Ask(ctx, s.bus, merchants.GetMerchant{ID: p.MerchantID}); err == nil {
 		v.Merchant = m.Name
 	}
@@ -377,12 +427,33 @@ func (s *Service) Checkout(ctx context.Context, id string) (CheckoutView, error)
 			return CheckoutView{}, err
 		}
 		for _, m := range ms {
-			if m.Available {
+			if m.Available && (p.PaymentMethod == "" || m.Method == p.PaymentMethod) {
 				v.Methods = append(v.Methods, m)
 			}
 		}
 	}
+	if p.Status == domain.Processing && p.PaymentMethod == providers.MethodBankTransfer {
+		if in, err := bus.Ask(ctx, s.bus, providers.GetInstructions{TxRef: p.ID}); err == nil {
+			v.Instructions = in
+		}
+	}
 	return v, nil
+}
+
+// CheckoutStatus: what the waiting page polls (no personal data).
+func (s *Service) CheckoutStatus(ctx context.Context, id string) (string, string, error) {
+	p, err := s.store.Get(s.db.WithContext(ctx), id, false)
+	if err != nil {
+		return "", "", err
+	}
+	return string(p.Status), p.FailureReason, nil
+}
+
+func maskPhone(p string) string {
+	if len(p) != 13 {
+		return ""
+	}
+	return p[:4] + " " + p[4:5] + "** *** " + p[10:]
 }
 
 func (s *Service) replay(ctx context.Context, merchantID, key, hash string) (*domain.Payment, error) {
@@ -955,4 +1026,106 @@ func (s *Service) OpenLink(ctx context.Context, id, customerIP string) (string, 
 		return s.store.SetLinkID(tx, p.ID, l.ID)
 	})
 	return checkout, err
+}
+
+// ---- Receipts ----
+
+// Notifiers: receipts to customers (nil = not configured).
+type Notifiers struct {
+	Mail mail.Sender
+	SMS  sms.Sender
+}
+
+func (s *Service) SetNotifiers(n Notifiers) { s.notify = n }
+
+type receipt struct {
+	email, phone, subject, text, sms string
+}
+
+// OnPaymentReceipt sends the customer a receipt once per payment: the event
+// is marked handled first (HandleOnce), the message goes out after the
+// commit, so a redelivered event never sends a second receipt.
+func (s *Service) OnPaymentReceipt(ctx context.Context, e bus.Envelope, evt payments.PaymentSucceeded) error {
+	var r *receipt
+	err := events.HandleOnce(ctx, s.db, "payment.receipt", e, func(tx *gorm.DB) error {
+		p, err := s.store.Get(tx, evt.PaymentID, false)
+		if err != nil {
+			return err
+		}
+		r = s.receipt(ctx, p, "paid", p.Amount)
+		return nil
+	})
+	if err == nil {
+		s.send(ctx, r)
+	}
+	return err
+}
+
+func (s *Service) OnRefundReceipt(ctx context.Context, e bus.Envelope, evt refunds.RefundSucceeded) error {
+	var r *receipt
+	err := events.HandleOnce(ctx, s.db, "payment.refund_receipt", e, func(tx *gorm.DB) error {
+		p, err := s.store.Get(tx, evt.PaymentID, false)
+		if err != nil {
+			return err
+		}
+		r = s.receipt(ctx, p, "refunded", evt.Amount)
+		return nil
+	})
+	if err == nil {
+		s.send(ctx, r)
+	}
+	return err
+}
+
+func (s *Service) receipt(ctx context.Context, p *domain.Payment, kind string, amount int64) *receipt {
+	if p.CustomerEmail == "" && p.CustomerPhone == "" {
+		return nil
+	}
+	merchant := "the merchant"
+	if m, err := bus.Ask(ctx, s.bus, merchants.GetMerchant{ID: p.MerchantID}); err == nil {
+		merchant = m.Name
+	}
+	amt := money.FormatMajor(amount) + " " + p.Currency
+	when := s.now().In(addis).Format("02 Jan 2006 15:04")
+	r := &receipt{email: p.CustomerEmail, phone: p.CustomerPhone}
+	if kind == "paid" {
+		r.subject = "Receipt: " + amt + " paid to " + merchant
+		r.text = fmt.Sprintf("You paid %s to %s.\nReference: %s\nPayment id: %s\nDate: %s (Addis Ababa)\n\n"+
+			"%s ለ%s ከፍለዋል።\nመለያ ቁጥር: %s\n\nKeep this email as your receipt. / ይህን መልእክት እንደ ደረሰኝ ያስቀምጡ።",
+			amt, merchant, p.Reference, p.ID, when, amt, merchant, p.Reference)
+		r.sms = fmt.Sprintf("Paid %s to %s. Ref %s. / %s ለ%s ተከፍሏል።", amt, merchant, p.Reference, amt, merchant)
+	} else {
+		r.subject = "Refund: " + amt + " from " + merchant
+		r.text = fmt.Sprintf("%s refunded %s of your payment %s.\nIt reaches your account or wallet as the provider processes it.\nDate: %s (Addis Ababa)\n\n"+
+			"%s ከክፍያዎ %s መልሷል።", merchant, amt, p.Reference, when, merchant, amt)
+		r.sms = fmt.Sprintf("%s refunded %s (ref %s). / %s %s መልሷል።", merchant, amt, p.Reference, merchant, amt)
+	}
+	return r
+}
+
+var addis = func() *time.Location {
+	if l, err := time.LoadLocation("Africa/Addis_Ababa"); err == nil {
+		return l
+	}
+	return time.FixedZone("EAT", 3*3600)
+}()
+
+// send delivers a receipt (best effort, logged: a lost receipt is better
+// than a duplicate; the merchant also has the payment record).
+func (s *Service) send(ctx context.Context, r *receipt) {
+	if r == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if r.email != "" && s.notify.Mail != nil {
+		if err := s.notify.Mail.Send(ctx, mail.Message{To: r.email, Subject: r.subject, Text: r.text}); err != nil {
+			s.log.Warn("receipt email not sent", "err", err)
+		}
+	}
+	if r.phone != "" && s.notify.SMS != nil {
+		if err := s.notify.SMS.Send(ctx, sms.Message{To: r.phone, Body: r.sms}); err != nil {
+			s.log.Warn("receipt SMS not sent", "err", err)
+		}
+	}
 }

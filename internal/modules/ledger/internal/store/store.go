@@ -42,19 +42,23 @@ func (s *Store) Post(q *gorm.DB, p domain.Posting, now time.Time) (bool, error) 
 	if err := p.Validate(); err != nil {
 		return false, err
 	}
-	tx := txRecord{ID: uuid.NewString(), Reference: p.Reference, Currency: p.Currency, Description: p.Description, CreatedAt: now}
-	res := q.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "reference"}}, DoNothing: true}).Create(&tx)
-	if res.Error != nil {
-		return false, res.Error
-	}
-	if res.RowsAffected == 0 {
-		return false, nil
-	}
-	entries := make([]entryRecord, len(p.Lines))
-	for i, l := range p.Lines {
-		entries[i] = entryRecord{TransactionID: tx.ID, Account: l.Account, Debit: l.Debit, Credit: l.Credit, Currency: p.Currency, CreatedAt: now}
-	}
-	return true, q.Create(&entries).Error
+	posted := false
+	// One database transaction (a savepoint inside an outer one): the
+	// database checks at commit that the posting balances.
+	err := q.Transaction(func(q *gorm.DB) error {
+		tx := txRecord{ID: uuid.NewString(), Reference: p.Reference, Currency: p.Currency, Description: p.Description, CreatedAt: now}
+		res := q.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "reference"}}, DoNothing: true}).Create(&tx)
+		if res.Error != nil || res.RowsAffected == 0 {
+			return res.Error
+		}
+		entries := make([]entryRecord, len(p.Lines))
+		for i, l := range p.Lines {
+			entries[i] = entryRecord{TransactionID: tx.ID, Account: l.Account, Debit: l.Debit, Credit: l.Credit, Currency: p.Currency, CreatedAt: now}
+		}
+		posted = true
+		return q.Create(&entries).Error
+	})
+	return posted && err == nil, err
 }
 
 // LockAccount serialises balance checks on one account (transaction-scoped).
@@ -167,5 +171,86 @@ func (s *Store) Statement(q *gorm.DB, account, currency string, from, to time.Ti
 		Joins("JOIN ledger_transactions t ON t.id = e.transaction_id").
 		Where("e.account = ? AND e.currency = ? AND e.created_at >= ? AND e.created_at < ? AND e.id > ?", account, currency, from, to, afterID).
 		Order("e.id").Limit(limit).Scan(&out).Error
+	return out, err
+}
+
+// ---- Manual corrections ----
+
+type Adjustment struct {
+	ID           string     `json:"id" gorm:"primaryKey"`
+	MerchantID   string     `json:"merchant_id"`
+	Environment  string     `json:"environment"`
+	Currency     string     `json:"currency"`
+	Direction    string     `json:"direction"`
+	Amount       int64      `json:"amount"`
+	Reason       string     `json:"reason"`
+	Status       string     `json:"status"`
+	RequestedBy  string     `json:"requested_by"`
+	RequestedAt  time.Time  `json:"requested_at"`
+	DecidedBy    *string    `json:"decided_by,omitempty"`
+	DecidedAt    *time.Time `json:"decided_at,omitempty"`
+	DecisionNote string     `json:"decision_note,omitempty"`
+}
+
+func (Adjustment) TableName() string { return "ledger_adjustments" }
+
+const (
+	AdjustmentPending  = "pending_approval"
+	AdjustmentApproved = "approved"
+	AdjustmentRejected = "rejected"
+)
+
+func (s *Store) InsertAdjustment(q *gorm.DB, a *Adjustment) error { return q.Create(a).Error }
+
+// LockAdjustment reads an adjustment for a decision (row lock).
+func (s *Store) LockAdjustment(q *gorm.DB, id string) (*Adjustment, error) {
+	var a Adjustment
+	err := q.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).Take(&a).Error
+	return &a, err
+}
+
+func (s *Store) SaveAdjustment(q *gorm.DB, a *Adjustment) error { return q.Save(a).Error }
+
+func (s *Store) ListAdjustments(q *gorm.DB, status string, limit int) ([]Adjustment, error) {
+	var out []Adjustment
+	if status != "" {
+		q = q.Where("status = ?", status)
+	}
+	err := q.Order("requested_at DESC").Limit(limit).Find(&out).Error
+	return out, err
+}
+
+// ---- Summary ----
+
+// ClassBalance: balance (credit - debit) of a group of accounts.
+type ClassBalance struct {
+	Class   string `json:"class"`
+	Balance int64  `json:"balance"`
+}
+
+// Summary groups the balances of one environment and currency by kind of
+// account: merchant:available, merchant:reserve, provider:clearing,
+// platform:fees, platform:settlement_bank ...
+func (s *Store) Summary(q *gorm.DB, env, currency string) ([]ClassBalance, error) {
+	var out []ClassBalance
+	err := q.Raw(`
+		SELECT CASE split_part(account, ':', 1)
+		         WHEN 'merchant' THEN 'merchant:' || split_part(account, ':', 3)
+		         WHEN 'provider' THEN 'provider:' || split_part(account, ':', 3)
+		         ELSE split_part(account, ':', 1) || ':' || split_part(account, ':', 2)
+		       END AS class,
+		       SUM(credit - debit) AS balance
+		  FROM ledger_entries
+		 WHERE currency = ? AND account LIKE ?
+		 GROUP BY 1 ORDER BY 1`, currency, "%:"+env).Scan(&out).Error
+	return out, err
+}
+
+// NegativeMerchants lists merchants whose available balance is below zero.
+func (s *Store) NegativeMerchants(q *gorm.DB, env, currency string) ([]ClassBalance, error) {
+	var out []ClassBalance
+	err := q.Raw(`SELECT split_part(account, ':', 2) AS class, SUM(credit - debit) AS balance
+		  FROM ledger_entries WHERE currency = ? AND account LIKE 'merchant:%:available:' || ?
+		 GROUP BY 1 HAVING SUM(credit - debit) < 0 ORDER BY 2`, currency, env).Scan(&out).Error
 	return out, err
 }
